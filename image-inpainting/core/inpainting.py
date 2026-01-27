@@ -3,6 +3,7 @@
 from PIL import Image
 from typing import Dict, List, Tuple, Optional
 import numpy as np
+import torch
 from simple_lama_inpainting import SimpleLama
 
 from core.image_utils import (
@@ -10,6 +11,16 @@ from core.image_utils import (
     validate_image_and_mask,
     masked_alpha_blend
 )
+
+
+def get_device():
+    """Get the best available device: MPS > CUDA > CPU."""
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    else:
+        return torch.device("cpu")
 
 
 class InpaintingEngine:
@@ -23,7 +34,9 @@ class InpaintingEngine:
     def _initialize_model(self):
         """SimpleLamaモデルを初期化する。"""
         try:
-            self.model = SimpleLama()
+            device = get_device()
+            print(f"LaMa Inpainting デバイス: {device}")
+            self.model = SimpleLama(device=device)
         except Exception as e:
             raise RuntimeError(f"SimpleLamaモデルの初期化に失敗しました: {str(e)}")
 

@@ -102,7 +102,16 @@ class GroundedSAMBackend(DetectorBackendBase):
         self._initialized = False
         self.sam_predictor = None
         self.grounding_dino_model = None
-        self.device = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
+        # Device selection: MPS (Apple Silicon) > CUDA > CPU
+        if TORCH_AVAILABLE:
+            if torch.backends.mps.is_available():
+                self.device = "mps"
+            elif torch.cuda.is_available():
+                self.device = "cuda"
+            else:
+                self.device = "cpu"
+        else:
+            self.device = "cpu"
 
     def _find_checkpoint(self, filename: str) -> Optional[str]:
         """Search for checkpoint file in common locations."""

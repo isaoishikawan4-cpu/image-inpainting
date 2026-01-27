@@ -128,9 +128,17 @@ class GroundedSAMDetector:
                  sam_model_type: str = "vit_h",
                  grounding_dino_config: str = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
                  grounding_dino_checkpoint: str = "groundingdino_swint_ogc.pth",
-                 device: str = "cuda"):
+                 device: str = None):
 
-        self.device = device if torch.cuda.is_available() else "cpu"
+        # Device selection: MPS (Apple Silicon) > CUDA > CPU
+        if device is not None:
+            self.device = device
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        else:
+            self.device = "cpu"
         print(f"デバイス: {self.device}")
 
         self.sam_predictor = None
