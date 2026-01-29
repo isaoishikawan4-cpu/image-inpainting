@@ -11,7 +11,7 @@ This package provides modular components for beard detection and removal:
 """
 
 from .image_handler import ImageHandler
-from .region_selector import RegionSelector
+from .region_selector import RegionSelector, SelectionShape
 from .beard_detector import (
     BeardDetector,
     GroundedSAMBackend,
@@ -20,8 +20,8 @@ from .beard_detector import (
     DetectionBackend,
 )
 from .highlighter import BeardRegionManager, SelectionMode, SelectionResult
-from .inpainter import LamaInpainter
-from .color_corrector import SkinColorCorrector, CorrectionMode
+from .inpainter import LamaInpainter, OpenCVInpainter, InpaintingMethod
+from .color_corrector import SkinColorCorrector, CorrectionMode, MaskType
 from .pipeline import BeardRemovalPipeline
 
 __all__ = [
@@ -30,6 +30,7 @@ __all__ = [
 
     # Region selection
     'RegionSelector',
+    'SelectionShape',
 
     # Detection
     'BeardDetector',
@@ -45,10 +46,13 @@ __all__ = [
 
     # Inpainting
     'LamaInpainter',
+    'OpenCVInpainter',
+    'InpaintingMethod',
 
     # Color Correction
     'SkinColorCorrector',
     'CorrectionMode',
+    'MaskType',
 
     # Pipeline
     'BeardRemovalPipeline',

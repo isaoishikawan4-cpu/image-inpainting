@@ -1,12 +1,19 @@
-"""Rectangle selection from Gradio ImageEditor.
+"""Region selection from Gradio ImageEditor.
 
 This module extracts user-drawn regions from Gradio ImageEditor component,
-typically used for selecting the detection area.
+supporting both rectangular and freeform selection modes.
 """
 
 import numpy as np
 import cv2
 from typing import Optional, Tuple
+from enum import Enum
+
+
+class SelectionShape(Enum):
+    """選択形状モード"""
+    RECTANGLE = "rectangle"   # 矩形（バウンディングボックス）
+    FREEFORM = "freeform"     # 自由形状（線で囲んだ領域）
 
 
 class RegionSelector:
@@ -115,6 +122,75 @@ class RegionSelector:
         return (x_min, y_min, x_max, y_max)
 
     @staticmethod
+    def extract_freeform_mask(editor_data: dict) -> Optional[np.ndarray]:
+        """
+        Extract freeform mask from ImageEditor brush strokes.
+
+        線で囲んだ領域を閉じた形状として認識し、その内部を塗りつぶしたマスクを返す。
+
+        Args:
+            editor_data: Dictionary from gr.ImageEditor containing:
+                - 'layers': List of layer arrays
+                - 'composite': Composite image with alpha
+
+        Returns:
+            Binary mask (255 = inside region) or None if no region drawn
+        """
+        if editor_data is None:
+            return None
+
+        try:
+            mask = RegionSelector._extract_mask_from_layers(editor_data)
+
+            if mask is None or np.max(mask) == 0:
+                return None
+
+            # 線で囲んだ領域を閉じた形状として処理
+            filled_mask = RegionSelector._fill_enclosed_region(mask)
+
+            return filled_mask
+
+        except Exception as e:
+            print(f"Error extracting freeform mask: {e}")
+            return None
+
+    @staticmethod
+    def _fill_enclosed_region(mask: np.ndarray) -> np.ndarray:
+        """
+        線で囲まれた領域を塗りつぶす。
+
+        Args:
+            mask: 線が描かれたバイナリマスク
+
+        Returns:
+            内部が塗りつぶされたマスク
+        """
+        # バイナリ化
+        mask_binary = (mask > 128).astype(np.uint8) * 255
+
+        # 線を少し太くして隙間を埋める
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask_dilated = cv2.dilate(mask_binary, kernel, iterations=1)
+
+        # 輪郭を検出
+        contours, _ = cv2.findContours(
+            mask_dilated,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        if not contours:
+            return mask_binary
+
+        # 塗りつぶし用の新しいマスクを作成
+        filled_mask = np.zeros_like(mask_binary)
+
+        # すべての輪郭を塗りつぶす
+        cv2.drawContours(filled_mask, contours, -1, 255, -1)  # -1 = 塗りつぶし
+
+        return filled_mask
+
+    @staticmethod
     def validate_region(
         region: Tuple[int, int, int, int],
         image_shape: Tuple[int, int],
@@ -146,3 +222,20 @@ class RegionSelector:
             return False
 
         return True
+
+    @staticmethod
+    def validate_mask(mask: np.ndarray, min_pixels: int = 100) -> bool:
+        """
+        Validate that a freeform mask has sufficient coverage.
+
+        Args:
+            mask: Binary mask array
+            min_pixels: Minimum number of white pixels
+
+        Returns:
+            True if mask is valid
+        """
+        if mask is None:
+            return False
+
+        return np.sum(mask > 0) >= min_pixels

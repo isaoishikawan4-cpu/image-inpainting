@@ -10,11 +10,11 @@ from typing import Tuple, List, Optional
 import cv2
 
 from .image_handler import ImageHandler
-from .region_selector import RegionSelector
+from .region_selector import RegionSelector, SelectionShape
 from .beard_detector import BeardDetector, DetectionBackend
 from .highlighter import BeardRegionManager, SelectionMode
-from .inpainter import LamaInpainter
-from .color_corrector import SkinColorCorrector, CorrectionMode
+from .inpainter import LamaInpainter, OpenCVInpainter, InpaintingMethod
+from .color_corrector import SkinColorCorrector, CorrectionMode, MaskType
 
 
 class BeardRemovalPipeline:
@@ -29,6 +29,7 @@ class BeardRemovalPipeline:
         self._detector = BeardDetector()
         self._region_manager = BeardRegionManager()
         self._inpainter = LamaInpainter()
+        self._opencv_inpainter = OpenCVInpainter()
         self._color_corrector = SkinColorCorrector()
         self._current_image: Optional[np.ndarray] = None
         self._last_inpaint_result: Optional[np.ndarray] = None
@@ -55,14 +56,16 @@ class BeardRemovalPipeline:
         # Rule-based parameters
         threshold_value: int = 80,
         min_area: int = 10,
-        max_area: int = 5000
+        max_area: int = 5000,
+        # Selection shape
+        selection_shape: str = "矩形"
     ) -> Tuple[np.ndarray, np.ndarray, str]:
         """
         Process beard detection (Tab 1 main function).
 
         Args:
             image: Input image from Gradio
-            editor_data: Rectangle selection from ImageEditor
+            editor_data: Rectangle/freeform selection from ImageEditor
             use_grounded_sam: Use Grounded SAM (True) or rule-based (False)
             text_prompt: Detection text prompt (for Grounded SAM)
             box_threshold: Box detection threshold (for Grounded SAM)
@@ -70,6 +73,7 @@ class BeardRemovalPipeline:
             threshold_value: Binarization threshold (for rule-based)
             min_area: Minimum region area
             max_area: Maximum region area
+            selection_shape: "矩形" or "自由形状"
 
         Returns:
             (display_image, mask, status_message)
@@ -84,59 +88,125 @@ class BeardRemovalPipeline:
         # Ensure RGB
         image_rgb = ImageHandler.ensure_rgb(image)
 
-        # Extract rectangle from editor
-        rect = RegionSelector.extract_rectangle(editor_data)
-        if rect is None:
-            return image_rgb, None, "Please draw a rectangle (use white brush to fill the area)"
+        # 選択形状に応じて処理を分岐
+        use_freeform = selection_shape == "自由形状"
 
-        x1, y1, x2, y2 = rect
+        if use_freeform:
+            # 自由形状モード: マスクを抽出
+            freeform_mask = RegionSelector.extract_freeform_mask(editor_data)
+            if freeform_mask is None or not RegionSelector.validate_mask(freeform_mask, min_pixels=100):
+                return image_rgb, None, "線で領域を囲んでください（閉じた形状になるように描画）"
 
-        try:
-            if use_grounded_sam:
-                # Grounded SAM detection
-                backend = self._detector.get_backend(DetectionBackend.GROUNDED_SAM)
-                if not backend.is_available():
-                    if not backend.initialize():
-                        return image_rgb, None, "Grounded SAM not available. Check checkpoints."
+            # バウンディングボックスも取得（表示用）
+            rect = RegionSelector.extract_rectangle(editor_data)
+            x1, y1, x2, y2 = rect if rect else (0, 0, image_rgb.shape[1], image_rgb.shape[0])
 
-                print(f"Grounded SAM detection... region=({x1}, {y1}, {x2}, {y2})")
-                regions = backend.detect(
-                    image_rgb, rect,
-                    text_prompt=text_prompt,
-                    box_threshold=box_threshold,
-                    text_threshold=text_threshold,
-                    min_area=min_area,
-                    max_area=max_area
+            try:
+                if use_grounded_sam:
+                    # Grounded SAM with freeform mask
+                    backend = self._detector.get_backend(DetectionBackend.GROUNDED_SAM)
+                    if not backend.is_available():
+                        if not backend.initialize():
+                            return image_rgb, None, "Grounded SAM not available. Check checkpoints."
+
+                    print(f"Grounded SAM detection (freeform)...")
+                    regions = self._detector.detect_with_mask(
+                        image_rgb, freeform_mask,
+                        backend=DetectionBackend.GROUNDED_SAM,
+                        text_prompt=text_prompt,
+                        box_threshold=box_threshold,
+                        text_threshold=text_threshold,
+                        min_area=min_area,
+                        max_area=max_area
+                    )
+                    mode_name = "Grounded SAM（自由形状）"
+                else:
+                    # Rule-based with freeform mask
+                    print(f"Rule-based detection (freeform)... threshold={threshold_value}")
+                    regions = self._detector.detect_with_mask(
+                        image_rgb, freeform_mask,
+                        backend=DetectionBackend.RULE_BASED,
+                        threshold_value=threshold_value,
+                        min_area=min_area,
+                        max_area=max_area
+                    )
+                    mode_name = "ルールベース（自由形状）"
+
+                self._region_manager.add_regions(regions)
+
+                # Create colored display
+                display = self._region_manager.create_colored_display(image_rgb, highlight_active=False)
+
+                # 自由形状の輪郭を描画（青色）
+                contours, _ = cv2.findContours(
+                    (freeform_mask > 128).astype(np.uint8) * 255,
+                    cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE
                 )
-                mode_name = "Grounded SAM"
-            else:
-                # Rule-based detection
-                print(f"Rule-based detection... region=({x1}, {y1}, {x2}, {y2}), threshold={threshold_value}")
-                regions = self._detector.detect(
-                    image_rgb, rect,
-                    backend=DetectionBackend.RULE_BASED,
-                    threshold_value=threshold_value,
-                    min_area=min_area,
-                    max_area=max_area
-                )
-                mode_name = "Rule-based"
+                cv2.drawContours(display, contours, -1, (0, 150, 255), 2)
 
-            self._region_manager.add_regions(regions)
+                # Create combined mask
+                mask = self._region_manager.get_all_masks_combined(image_rgb.shape[:2])
 
-            # Create colored display
-            display = self._region_manager.create_colored_display(image_rgb, highlight_active=False)
+                status = f"検出完了 [{mode_name}]: {len(regions)} 本の髭を検出"
+                return display, mask, status
 
-            # Create combined mask
-            mask = self._region_manager.get_all_masks_combined(image_rgb.shape[:2])
+            except Exception as e:
+                return image_rgb, None, f"Detection error: {str(e)}"
+        else:
+            # 矩形モード（従来の処理）
+            rect = RegionSelector.extract_rectangle(editor_data)
+            if rect is None:
+                return image_rgb, None, "矩形で範囲を囲んでください（白色ブラシで塗りつぶし）"
 
-            # Draw detection region rectangle
-            cv2.rectangle(display, (x1, y1), (x2, y2), (255, 255, 255), 2)
+            x1, y1, x2, y2 = rect
 
-            status = f"Detection complete [{mode_name}]: {len(regions)} beards detected | Region: ({x1},{y1})-({x2},{y2})"
-            return display, mask, status
+            try:
+                if use_grounded_sam:
+                    # Grounded SAM detection
+                    backend = self._detector.get_backend(DetectionBackend.GROUNDED_SAM)
+                    if not backend.is_available():
+                        if not backend.initialize():
+                            return image_rgb, None, "Grounded SAM not available. Check checkpoints."
 
-        except Exception as e:
-            return image_rgb, None, f"Detection error: {str(e)}"
+                    print(f"Grounded SAM detection... region=({x1}, {y1}, {x2}, {y2})")
+                    regions = backend.detect(
+                        image_rgb, rect,
+                        text_prompt=text_prompt,
+                        box_threshold=box_threshold,
+                        text_threshold=text_threshold,
+                        min_area=min_area,
+                        max_area=max_area
+                    )
+                    mode_name = "Grounded SAM"
+                else:
+                    # Rule-based detection
+                    print(f"Rule-based detection... region=({x1}, {y1}, {x2}, {y2}), threshold={threshold_value}")
+                    regions = self._detector.detect(
+                        image_rgb, rect,
+                        backend=DetectionBackend.RULE_BASED,
+                        threshold_value=threshold_value,
+                        min_area=min_area,
+                        max_area=max_area
+                    )
+                    mode_name = "ルールベース"
+
+                self._region_manager.add_regions(regions)
+
+                # Create colored display
+                display = self._region_manager.create_colored_display(image_rgb, highlight_active=False)
+
+                # Create combined mask
+                mask = self._region_manager.get_all_masks_combined(image_rgb.shape[:2])
+
+                # Draw detection region rectangle
+                cv2.rectangle(display, (x1, y1), (x2, y2), (255, 255, 255), 2)
+
+                status = f"検出完了 [{mode_name}]: {len(regions)} 本の髭を検出 | 領域: ({x1},{y1})-({x2},{y2})"
+                return display, mask, status
+
+            except Exception as e:
+                return image_rgb, None, f"Detection error: {str(e)}"
 
     def update_selection(
         self,
@@ -200,16 +270,20 @@ class BeardRemovalPipeline:
         image: Image.Image,
         mask: np.ndarray,
         thinning_levels: List[int],
-        progress=None
+        progress=None,
+        method: str = "lama",
+        opencv_radius: int = 3
     ) -> Tuple[List[Tuple[Image.Image, str]], str]:
         """
-        Process LaMa inpainting (Tab 2 main function).
+        Process inpainting (Tab 2 main function).
 
         Args:
             image: Input PIL image
             mask: Binary mask
             thinning_levels: List of levels [30, 50, 70, 100]
             progress: Gradio progress tracker
+            method: "lama", "opencv_telea", or "opencv_ns"
+            opencv_radius: Inpainting radius for OpenCV methods (1-20)
 
         Returns:
             (gallery_items, status_message)
@@ -222,9 +296,24 @@ class BeardRemovalPipeline:
                 except:
                     pass
 
-        return self._inpainter.process_thinning_levels(
-            image, mask, thinning_levels, progress_callback
-        )
+        # Select inpainting method
+        if method == "opencv_telea":
+            self._opencv_inpainter.set_method(InpaintingMethod.OPENCV_TELEA)
+            self._opencv_inpainter.set_radius(opencv_radius)
+            return self._opencv_inpainter.process_thinning_levels(
+                image, mask, thinning_levels, progress_callback
+            )
+        elif method == "opencv_ns":
+            self._opencv_inpainter.set_method(InpaintingMethod.OPENCV_NS)
+            self._opencv_inpainter.set_radius(opencv_radius)
+            return self._opencv_inpainter.process_thinning_levels(
+                image, mask, thinning_levels, progress_callback
+            )
+        else:
+            # Default: LaMa
+            return self._inpainter.process_thinning_levels(
+                image, mask, thinning_levels, progress_callback
+            )
 
     def reset(self) -> None:
         """Reset all state for new image."""
@@ -268,7 +357,9 @@ class BeardRemovalPipeline:
         edge_blur: int = 15,
         a_adjustment_factor: float = 0.3,
         b_adjustment_factor: float = 0.6,
-        l_adjustment_factor: float = 0.5
+        l_adjustment_factor: float = 0.5,
+        use_scattered_mode: bool = False,
+        use_direct_fill: bool = False
     ) -> Tuple[np.ndarray, str]:
         """
         Process color correction (Tab 3 main function).
@@ -283,6 +374,7 @@ class BeardRemovalPipeline:
             a_adjustment_factor: a*（赤-緑軸）の調整係数 (0.0-1.0) デフォルト0.3
             b_adjustment_factor: b*（青-黄軸）の調整係数 (0.0-1.0) デフォルト0.6
             l_adjustment_factor: L（明度）の調整係数 (0.0-1.0) デフォルト0.5
+            use_scattered_mode: Tab 1の散らばった髭領域を使用する場合True
 
         Returns:
             (result_image, status_message)
@@ -297,6 +389,9 @@ class BeardRemovalPipeline:
 
         # Map correction mode
         mode = self._map_correction_mode(correction_mode)
+
+        # Determine mask type
+        mask_type = MaskType.SCATTERED if use_scattered_mode else MaskType.MANUAL
 
         # For color transfer mode, extract source mask
         source_mask = None
@@ -319,7 +414,9 @@ class BeardRemovalPipeline:
                 mode=mode,
                 a_adjustment_factor=a_adjustment_factor,
                 b_adjustment_factor=b_adjustment_factor,
-                l_adjustment_factor=l_adjustment_factor
+                l_adjustment_factor=l_adjustment_factor,
+                mask_type=mask_type,
+                use_direct_fill=use_direct_fill
             )
 
             # Convert back to RGB
@@ -331,7 +428,8 @@ class BeardRemovalPipeline:
                 CorrectionMode.AUTO_DETECT: "自動補正"
             }.get(mode, "不明")
 
-            status = f"色調補正完了 [{mode_name}] | 強度: {int(strength * 100)}% | LAB: a*={a_adjustment_factor:.0%}, b*={b_adjustment_factor:.0%}, L={l_adjustment_factor:.0%}"
+            mask_mode_text = "（散らばった領域モード）" if use_scattered_mode else ""
+            status = f"色調補正完了 [{mode_name}]{mask_mode_text} | 強度: {int(strength * 100)}% | LAB: a*={a_adjustment_factor:.0%}, b*={b_adjustment_factor:.0%}, L={l_adjustment_factor:.0%}"
             return result_rgb, status
 
         except Exception as e:

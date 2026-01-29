@@ -19,6 +19,12 @@ class CorrectionMode(Enum):
     AUTO_DETECT = "auto_detect"         # 自動検出+補正
 
 
+class MaskType(Enum):
+    """マスクの種類（補正強度の調整に使用）"""
+    MANUAL = "manual"           # 手動塗り（連続した領域）
+    SCATTERED = "scattered"     # Tab 1からの散らばった髭領域
+
+
 class SkinColorCorrector:
     """LAB色空間を使った肌色補正（青髭補正特化）"""
 
@@ -35,7 +41,9 @@ class SkinColorCorrector:
         mode: CorrectionMode = CorrectionMode.BLUE_REMOVAL,
         a_adjustment_factor: float = 0.3,
         b_adjustment_factor: float = 0.6,
-        l_adjustment_factor: float = 0.5
+        l_adjustment_factor: float = 0.5,
+        mask_type: MaskType = MaskType.MANUAL,
+        use_direct_fill: bool = False
     ) -> np.ndarray:
         """
         対象領域の色を補正する（統合インターフェース）
@@ -50,6 +58,8 @@ class SkinColorCorrector:
             a_adjustment_factor: a*（赤-緑軸）の調整係数 (0.0-1.0)
             b_adjustment_factor: b*（青-黄軸）の調整係数 (0.0-1.0)
             l_adjustment_factor: L（明度）の調整係数 (0.0-1.0)
+            mask_type: マスクの種類（MANUAL=手動塗り, SCATTERED=Tab1の散らばった領域）
+            use_direct_fill: 美肌塗りつぶしモード（色味転送時）
 
         Returns:
             色調補正された画像
@@ -57,16 +67,21 @@ class SkinColorCorrector:
         if mode == CorrectionMode.BLUE_REMOVAL:
             return self.remove_blue_tint(
                 image, target_mask, strength, edge_blur,
-                a_adjustment_factor, b_adjustment_factor, l_adjustment_factor
+                a_adjustment_factor, b_adjustment_factor, l_adjustment_factor,
+                mask_type
             )
         elif mode == CorrectionMode.COLOR_TRANSFER:
             if source_mask is None:
                 raise ValueError("COLOR_TRANSFER モードでは source_mask が必要です")
-            return self.transfer_color_from_source(image, target_mask, source_mask, strength, edge_blur)
+            return self.transfer_color_from_source(
+                image, target_mask, source_mask, strength, edge_blur,
+                use_direct_fill=use_direct_fill
+            )
         elif mode == CorrectionMode.AUTO_DETECT:
             return self.auto_correct(
                 image, target_mask, strength, edge_blur,
-                a_adjustment_factor, b_adjustment_factor, l_adjustment_factor
+                a_adjustment_factor, b_adjustment_factor, l_adjustment_factor,
+                mask_type
             )
         else:
             raise ValueError(f"Unknown mode: {mode}")
@@ -79,7 +94,8 @@ class SkinColorCorrector:
         edge_blur: int = 15,
         a_adjustment_factor: float = 0.3,
         b_adjustment_factor: float = 0.6,
-        l_adjustment_factor: float = 0.5
+        l_adjustment_factor: float = 0.5,
+        mask_type: MaskType = MaskType.MANUAL
     ) -> np.ndarray:
         """
         青髭を素肌に近づける（美肌補正版）
@@ -95,6 +111,7 @@ class SkinColorCorrector:
             a_adjustment_factor: a*（赤-緑軸）の調整係数 (0.0-1.0) デフォルト0.3
             b_adjustment_factor: b*（青-黄軸）の調整係数 (0.0-1.0) デフォルト0.6
             l_adjustment_factor: L（明度）の調整係数 (0.0-1.0) デフォルト0.5
+            mask_type: マスクの種類（散らばった領域の場合は補正を強化）
 
         Returns:
             美肌補正された画像 (BGR)
@@ -104,6 +121,28 @@ class SkinColorCorrector:
 
         if not np.any(target_mask > 0):
             return image
+
+        # ========== 散らばった領域向けの最適化 ==========
+        # Tab 1のマスク（散らばった小さな髭領域）の場合、
+        # エッジぼかしとスムージングを減らして補正効果を維持
+        use_texture_preservation = False
+        if mask_type == MaskType.SCATTERED:
+            use_texture_preservation = True
+
+            # 散らばった領域用のパラメータ調整
+            # 1. マスクを少し膨張させて領域を繋げる
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            target_mask = cv2.dilate(target_mask, kernel, iterations=1)
+
+            # 2. エッジぼかしを減らす（小さい領域では効果が打ち消されるため）
+            edge_blur = max(3, edge_blur // 3)
+
+            # 3. LAB調整係数を強化（散らばった領域では効果が見えにくいため）
+            a_adjustment_factor = min(1.0, a_adjustment_factor * 1.5)
+            b_adjustment_factor = min(1.0, b_adjustment_factor * 1.5)
+            l_adjustment_factor = min(1.0, l_adjustment_factor * 1.3)
+
+            print(f"[散らばった領域モード] edge_blur={edge_blur}, LAB強化係数適用, テクスチャ保持=ON")
 
         result = image.copy()
 
@@ -168,19 +207,54 @@ class SkinColorCorrector:
         # BGRに戻す
         result_bgr = cv2.cvtColor(lab_image, cv2.COLOR_LAB2BGR)
 
-        # ========== 美肌スムージング ==========
-        # バイラテラルフィルタでエッジを保持しながらテクスチャを滑らかに
-        # d=9: フィルタサイズ, sigmaColor=75: 色の差の許容度, sigmaSpace=75: 空間的な距離
-        smoothed = cv2.bilateralFilter(result_bgr, d=9, sigmaColor=75, sigmaSpace=75)
+        # ========== テクスチャ保持モード ==========
+        if use_texture_preservation:
+            # 元画像から高周波成分（テクスチャ）を抽出
+            # 周波数分離: 元画像 = 低周波（色）+ 高周波（テクスチャ）
+            original_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            result_gray = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-        # 元画像とスムージング画像をstrengthでブレンド
-        # strengthが高いほどスムージング効果を強く
-        smooth_strength = min(strength * 0.8, 0.9)  # 最大90%までスムージング
-        result_bgr = cv2.addWeighted(
-            result_bgr, 1.0 - smooth_strength,
-            smoothed, smooth_strength,
-            0
-        )
+            # 低周波成分を取得（ぼかし）
+            blur_size = 15
+            original_lowfreq = cv2.GaussianBlur(original_gray, (blur_size, blur_size), 0)
+            result_lowfreq = cv2.GaussianBlur(result_gray, (blur_size, blur_size), 0)
+
+            # 高周波成分（テクスチャ）= 元画像 - 低周波
+            texture = original_gray - original_lowfreq
+
+            # 補正結果の低周波 + 元のテクスチャ
+            # これにより色は補正されるがテクスチャは保持される
+            new_gray = result_lowfreq + texture
+
+            # グレースケールの変化量を計算
+            gray_diff = new_gray - result_gray
+
+            # 各チャンネルにテクスチャの変化を適用
+            result_bgr = result_bgr.astype(np.float32)
+            for c in range(3):
+                result_bgr[:, :, c] += gray_diff * 0.7  # 70%のテクスチャを復元
+            result_bgr = np.clip(result_bgr, 0, 255).astype(np.uint8)
+
+            # 微細なノイズを追加して自然さを演出
+            noise = np.random.normal(0, 2, result_bgr.shape).astype(np.float32)
+            result_bgr = np.clip(result_bgr.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+            print("[テクスチャ保持] 高周波成分を復元、微細ノイズ追加")
+
+            # スムージングは行わない（テクスチャを維持するため）
+        else:
+            # ========== 従来の美肌スムージング ==========
+            smooth_strength = min(strength * 0.8, 0.9)
+
+            # バイラテラルフィルタでエッジを保持しながらテクスチャを滑らかに
+            smoothed = cv2.bilateralFilter(result_bgr, d=9, sigmaColor=75, sigmaSpace=75)
+
+            # 元画像とスムージング画像をstrengthでブレンド
+            result_bgr = cv2.addWeighted(
+                result_bgr, 1.0 - smooth_strength,
+                smoothed, smooth_strength,
+                0
+            )
 
         # エッジをぼかしてブレンド（境界を自然に）
         result = self._blend_with_edge_blur(image, result_bgr, target_mask, edge_blur)
@@ -193,13 +267,11 @@ class SkinColorCorrector:
         target_mask: np.ndarray,
         source_mask: np.ndarray,
         strength: float = 1.0,
-        edge_blur: int = 15
+        edge_blur: int = 15,
+        use_direct_fill: bool = False
     ) -> np.ndarray:
         """
-        スポイト領域の色味を転送（元のアルゴリズム）
-
-        明度(L)ごとの色味(a*, b*)のLUTを作成し、
-        対象領域に適用する。
+        スポイト領域の色味を転送
 
         Args:
             image: 入力画像 (BGR)
@@ -207,6 +279,7 @@ class SkinColorCorrector:
             source_mask: 色を取得する領域のマスク（頬など）
             strength: 補正強度 (0.0-1.0)
             edge_blur: エッジぼかしサイズ
+            use_direct_fill: True=美肌塗りつぶしモード, False=LUTベース（従来）
 
         Returns:
             色調補正された画像 (BGR)
@@ -221,6 +294,25 @@ class SkinColorCorrector:
             print("警告: スポイト領域が選択されていません")
             return image
 
+        # モード分岐
+        if use_direct_fill:
+            return self._transfer_color_direct_fill(
+                image, target_mask, source_mask, strength, edge_blur
+            )
+        else:
+            return self._transfer_color_lut_based(
+                image, target_mask, source_mask, strength, edge_blur
+            )
+
+    def _transfer_color_lut_based(
+        self,
+        image: np.ndarray,
+        target_mask: np.ndarray,
+        source_mask: np.ndarray,
+        strength: float,
+        edge_blur: int
+    ) -> np.ndarray:
+        """LUTベースの色味転送（従来方式）"""
         result = image.copy()
 
         # LAB色空間に変換
@@ -256,6 +348,129 @@ class SkinColorCorrector:
 
         return result
 
+    def _transfer_color_direct_fill(
+        self,
+        image: np.ndarray,
+        target_mask: np.ndarray,
+        source_mask: np.ndarray,
+        strength: float,
+        edge_blur: int
+    ) -> np.ndarray:
+        """美肌塗りつぶしモード：参照色で直接塗りつぶし＋自然なブレンド"""
+        result = image.copy()
+
+        # LAB色空間に変換
+        lab_image = cv2.cvtColor(result, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+        # ========== 参照領域の美肌色を取得 ==========
+        source_pixels_lab = lab_image[source_mask > 0]
+
+        # 明るめの肌色を目標にする（60パーセンタイル - 少し控えめに）
+        target_l = np.percentile(source_pixels_lab[:, 0], 60)
+        target_a = np.median(source_pixels_lab[:, 1])
+        target_b = np.median(source_pixels_lab[:, 2])
+
+        print(f"[美肌塗りつぶし] 参照色: L={target_l:.1f}, a={target_a:.1f}, b={target_b:.1f}, 強度={strength:.0%}")
+
+        # ========== 対象領域を美肌色で塗りつぶし ==========
+        target_y, target_x = np.where(target_mask > 0)
+
+        if len(target_y) == 0:
+            return image
+
+        # 元の値を保存
+        original_l = lab_image[target_y, target_x, 0]
+        original_a = lab_image[target_y, target_x, 1]
+        original_b = lab_image[target_y, target_x, 2]
+
+        # 元の色のバリエーション（標準偏差）を計算
+        original_l_std = np.std(original_l)
+        original_a_std = np.std(original_a)
+        original_b_std = np.std(original_b)
+
+        # 美肌色に近づける（強度に応じて）
+        new_l = original_l + (target_l - original_l) * strength
+        new_a = original_a + (target_a - original_a) * strength
+        new_b = original_b + (target_b - original_b) * strength
+
+        # ========== 色のバリエーションを復元（ベタ塗り防止） ==========
+        # 元の色の偏差を一部残す
+        variation_keep = 0.4  # 元のバリエーションを40%残す
+        l_deviation = original_l - np.mean(original_l)
+        a_deviation = original_a - np.mean(original_a)
+        b_deviation = original_b - np.mean(original_b)
+
+        new_l = new_l + l_deviation * variation_keep
+        new_a = new_a + a_deviation * variation_keep
+        new_b = new_b + b_deviation * variation_keep
+
+        lab_image[target_y, target_x, 0] = new_l
+        lab_image[target_y, target_x, 1] = new_a
+        lab_image[target_y, target_x, 2] = new_b
+
+        # 値をクリップ
+        lab_image = np.clip(lab_image, 0, 255).astype(np.uint8)
+
+        # BGRに戻す
+        result_bgr = cv2.cvtColor(lab_image, cv2.COLOR_LAB2BGR)
+
+        # ========== テクスチャ保持（肌のきめを強く復元） ==========
+        original_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        result_gray = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+        # 高周波成分（テクスチャ）を抽出 - より細かいテクスチャを保持
+        blur_size = 9  # 小さくしてより細かいテクスチャを保持
+        original_lowfreq = cv2.GaussianBlur(original_gray, (blur_size, blur_size), 0)
+        result_lowfreq = cv2.GaussianBlur(result_gray, (blur_size, blur_size), 0)
+
+        texture = original_gray - original_lowfreq
+
+        # テクスチャを強く復元（0.7→1.0）
+        texture_strength = 1.0
+        new_gray = result_lowfreq + texture * texture_strength
+        gray_diff = new_gray - result_gray
+
+        result_bgr = result_bgr.astype(np.float32)
+        texture_mask_float = (target_mask > 0).astype(np.float32)
+
+        for c in range(3):
+            result_bgr[:, :, c] += gray_diff * texture_strength * texture_mask_float
+
+        result_bgr = np.clip(result_bgr, 0, 255).astype(np.uint8)
+
+        # ========== スムージングを大幅に軽減 ==========
+        # スムージングはほぼ無しに（テクスチャを壊さない）
+        smooth_strength = min(strength * 0.2, 0.3)  # 大幅に軽減
+        if smooth_strength > 0.1:
+            smoothed = cv2.bilateralFilter(result_bgr, d=5, sigmaColor=30, sigmaSpace=30)
+            mask_float = target_mask.astype(np.float32) / 255.0
+            mask_3ch = np.stack([mask_float] * 3, axis=-1)
+            result_bgr = (
+                result_bgr.astype(np.float32) * (1.0 - smooth_strength * mask_3ch) +
+                smoothed.astype(np.float32) * (smooth_strength * mask_3ch)
+            ).astype(np.uint8)
+
+        # ========== 周囲との自然なブレンド（多段階） ==========
+        # 1. まずマスク境界を大きくぼかしてグラデーション作成
+        feather_size = 31  # フェザリングサイズ
+        feathered_mask = cv2.GaussianBlur(
+            target_mask.astype(np.float32),
+            (feather_size, feather_size), 0
+        ) / 255.0
+
+        # 2. フェザリングマスクでブレンド（グラデーション効果）
+        feathered_3ch = np.stack([feathered_mask] * 3, axis=-1)
+        result_bgr = (
+            image.astype(np.float32) * (1.0 - feathered_3ch) +
+            result_bgr.astype(np.float32) * feathered_3ch
+        ).astype(np.uint8)
+
+        # 3. さらにエッジブラーで仕上げ
+        effective_edge_blur = max(edge_blur, 15)
+        result = self._blend_with_edge_blur(image, result_bgr, target_mask, effective_edge_blur)
+
+        return result
+
     def auto_correct(
         self,
         image: np.ndarray,
@@ -264,7 +479,8 @@ class SkinColorCorrector:
         edge_blur: int = 15,
         a_adjustment_factor: float = 0.3,
         b_adjustment_factor: float = 0.6,
-        l_adjustment_factor: float = 0.5
+        l_adjustment_factor: float = 0.5,
+        mask_type: MaskType = MaskType.MANUAL
     ) -> np.ndarray:
         """
         自動検出+補正
@@ -280,6 +496,7 @@ class SkinColorCorrector:
             a_adjustment_factor: a*（赤-緑軸）の調整係数 (0.0-1.0)
             b_adjustment_factor: b*（青-黄軸）の調整係数 (0.0-1.0)
             l_adjustment_factor: L（明度）の調整係数 (0.0-1.0)
+            mask_type: マスクの種類
 
         Returns:
             自動補正された画像 (BGR)
@@ -298,7 +515,8 @@ class SkinColorCorrector:
             print("周辺肌色を検出できませんでした。青み除去モードで処理します。")
             return self.remove_blue_tint(
                 image, target_mask, strength, edge_blur,
-                a_adjustment_factor, b_adjustment_factor, l_adjustment_factor
+                a_adjustment_factor, b_adjustment_factor, l_adjustment_factor,
+                mask_type
             )
 
         # 色味転送を実行

@@ -425,6 +425,119 @@ class RuleBasedBackend(DetectorBackendBase):
         print(f"Rule-based detection: {len(results)} beards detected")
         return results
 
+    def detect_with_mask(
+        self,
+        image_rgb: np.ndarray,
+        region_mask: np.ndarray,
+        threshold_value: int = 80,
+        min_area: int = 10,
+        max_area: int = 5000
+    ) -> List[DetectedRegion]:
+        """
+        Detect using freeform mask (自由形状での検出).
+
+        Args:
+            image_rgb: RGB image array
+            region_mask: Binary mask defining the detection region
+            threshold_value: Binarization threshold
+            min_area: Minimum region area
+            max_area: Maximum region area
+
+        Returns:
+            List of DetectedRegion objects
+        """
+        h_orig, w_orig = image_rgb.shape[:2]
+
+        # マスクのバウンディングボックスを取得（処理効率化のため）
+        mask_binary = (region_mask > 128).astype(np.uint8) * 255
+        contours_mask, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours_mask:
+            print("No valid region in freeform mask")
+            return []
+
+        # 全輪郭を含むバウンディングボックスを計算
+        x_min, y_min = w_orig, h_orig
+        x_max, y_max = 0, 0
+        for contour in contours_mask:
+            x, y, w, h = cv2.boundingRect(contour)
+            x_min = min(x_min, x)
+            y_min = min(y_min, y)
+            x_max = max(x_max, x + w)
+            y_max = max(y_max, y + h)
+
+        # 少しマージンを追加
+        margin = 5
+        x1 = max(0, x_min - margin)
+        y1 = max(0, y_min - margin)
+        x2 = min(w_orig, x_max + margin)
+        y2 = min(h_orig, y_max + margin)
+
+        # Crop ROI and convert to BGR
+        roi_rgb = image_rgb[y1:y2, x1:x2]
+        roi_bgr = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2BGR)
+        roi_mask = mask_binary[y1:y2, x1:x2]
+
+        # Convert to grayscale
+        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+
+        # CLAHE (contrast enhancement)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        # Gaussian blur
+        blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
+
+        # Adaptive threshold
+        adaptive = cv2.adaptiveThreshold(
+            blurred, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 11, 2
+        )
+
+        # Fixed threshold
+        _, binary = cv2.threshold(blurred, threshold_value, 255, cv2.THRESH_BINARY_INV)
+
+        # Combine both masks
+        detection_mask = cv2.bitwise_and(adaptive, binary)
+
+        # 自由形状マスクでフィルタリング
+        detection_mask = cv2.bitwise_and(detection_mask, roi_mask)
+
+        # Morphological operations
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        detection_mask = cv2.morphologyEx(detection_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        detection_mask = cv2.morphologyEx(detection_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        # Find contours
+        contours, _ = cv2.findContours(detection_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        results = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if min_area < area < max_area:
+                # Create full-size mask
+                full_mask = np.zeros((h_orig, w_orig), dtype=np.uint8)
+                offset_contour = contour + np.array([x1, y1])
+                cv2.drawContours(full_mask, [offset_contour], -1, 255, -1)
+
+                # Calculate centroid
+                M = cv2.moments(full_mask)
+                cx = int(M['m10'] / M['m00']) if M['m00'] > 0 else x1
+                cy = int(M['m01'] / M['m00']) if M['m00'] > 0 else y1
+
+                results.append(DetectedRegion(
+                    mask=full_mask,
+                    area=int(area),
+                    centroid=(cx, cy),
+                    confidence=1.0,
+                    source='rule_based',
+                    phrase=""
+                ))
+
+        print(f"Rule-based detection (freeform): {len(results)} beards detected")
+        return results
+
 
 class BeardDetector:
     """Unified beard detector with multiple backends."""
@@ -463,6 +576,61 @@ class BeardDetector:
         """
         detector = self.get_backend(backend)
         return detector.detect(image_rgb, region_box, **kwargs)
+
+    def detect_with_mask(
+        self,
+        image_rgb: np.ndarray,
+        region_mask: np.ndarray,
+        backend: DetectionBackend = DetectionBackend.RULE_BASED,
+        **kwargs
+    ) -> List[DetectedRegion]:
+        """
+        Detect beard regions using freeform mask (自由形状での検出).
+
+        Args:
+            image_rgb: RGB image array
+            region_mask: Binary mask defining the detection region
+            backend: Which detection backend to use
+            **kwargs: Backend-specific parameters
+
+        Returns:
+            List of DetectedRegion objects
+        """
+        if backend == DetectionBackend.RULE_BASED:
+            return self._rule_based.detect_with_mask(image_rgb, region_mask, **kwargs)
+        else:
+            # Grounded SAM: マスクのバウンディングボックスを使用
+            mask_binary = (region_mask > 128).astype(np.uint8) * 255
+            contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return []
+
+            # バウンディングボックスを計算
+            h, w = image_rgb.shape[:2]
+            x_min, y_min, x_max, y_max = w, h, 0, 0
+            for contour in contours:
+                x, y, cw, ch = cv2.boundingRect(contour)
+                x_min = min(x_min, x)
+                y_min = min(y_min, y)
+                x_max = max(x_max, x + cw)
+                y_max = max(y_max, y + ch)
+
+            region_box = (x_min, y_min, x_max, y_max)
+
+            # Grounded SAMで検出後、マスク内の結果のみフィルタリング
+            detector = self.get_backend(backend)
+            results = detector.detect(image_rgb, region_box, **kwargs)
+
+            # マスク内の領域のみ保持
+            filtered_results = []
+            for region in results:
+                # 領域の重心がマスク内にあるかチェック
+                cx, cy = region.centroid
+                if region_mask[cy, cx] > 128:
+                    filtered_results.append(region)
+
+            print(f"Grounded SAM (freeform): {len(filtered_results)}/{len(results)} regions in mask")
+            return filtered_results
 
     def is_grounded_sam_available(self) -> bool:
         """Check if Grounded SAM backend is available."""
