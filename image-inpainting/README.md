@@ -1,16 +1,24 @@
-# 髭検出・修復アプリケーション v3/v4
+# 髭検出・除去シミュレーション　アプリ v6
 
-髭を検出し、LaMa Inpainting で自然に除去・薄めするGradioアプリケーション。
+髭を検出し、MAT/LaMaによる修復、色補正を行うアプリケーション。
 
 ## 機能
 
+### v6 新機能
+- **MAT (Mask-Aware Transformer) Inpainting**: CVPR 2022 Best Paper Finalist
+- **顔画像に特化**: 512x512で処理する高品質なinpainting
+- **2つのプリトレーニングモデル**: FFHQ / CelebA-HQ 対応
+- **MAT強化モード**: テクスチャ保持 + 青髭補正の組み合わせ
+
+### 基本機能
 - **ルールベース検出**: 髭を1本ずつ高精度に検出（推奨）
 - **Grounded SAM**: テキストプロンプトによる自動髭検出（オプション）
-- **矩形選択**: 白ブラシで検出領域を指定
+- **矩形選択 / 座標入力**: 検出領域を指定
 - **カラーハイライト**: 検出した各髭を異なる色でハイライト表示
 - **削除対象選択**: ランダム/面積大/面積小/信頼度順で削除対象を選択（赤色で強調）
-- **LaMa Inpainting**: 高品質な髭除去・段階的な薄め（30%, 50%, 70%, 100%）
-- **色調補正（v4）**: LAB色空間ベースの青髭補正機能
+- **MAT / LaMa / OpenCV Inpainting**: 高品質な髭除去・段階的な薄め（30%, 50%, 70%, 100%）
+- **色調補正**: LAB色空間ベースの青髭補正機能
+- **髭オーバーレイ**: 残した髭を元画像から重ねて自然な薄め効果を実現
 
 ## 必要な環境
 
@@ -27,7 +35,21 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 pip install simple-lama-inpainting
 ```
 
-### 2. オプション: Grounded SAM（高度な検出機能）
+### 2. オプション: MAT Inpainting（v6推奨）
+
+MAT (Mask-Aware Transformer) を使用する場合に必要です。
+
+**チェックポイントのダウンロード:**
+
+| ファイル | 配置場所 |
+|---------|---------|
+| `MAT_FFHQ_512_fp16.safetensors` | `checkpoints/mat/` |
+| `MAT_CelebA-HQ_512_fp16.safetensors` | `checkpoints/mat/` |
+
+※ チェックポイントは [Hugging Face](https://huggingface.co/spacepxl/MAT-inpainting-fp16) からダウンロード
+※ オリジナルの `.pkl` 形式も使用可能（[MAT公式リポジトリ](https://github.com/fenglinglwb/MAT)）
+
+### 3. オプション: Grounded SAM（高度な検出機能）
 
 Grounded SAM を使用する場合のみ必要です。ルールベース検出のみ使用する場合は不要です。
 
@@ -48,22 +70,24 @@ pip install segment-anything groundingdino-py
 
 ```
 image-inpainting/
-├── app_gradio_v3.py          # v3 アプリケーション
-├── app_gradio_v4.py          # v4 アプリケーション（モジュラー版）
+├── app_gradio_v6.py          # v6 アプリケーション（MAT対応）
 ├── config.py                 # 設定ファイル（MAX_IMAGE_SIZE, FEATHER_RADIUS等）
 ├── core/                     # コアモジュール
 │   ├── __init__.py
 │   ├── inpainting.py         # LaMa Inpainting ラッパー（SimpleLama使用）
+│   ├── mat_engine.py         # MAT Inpainting エンジン
+│   ├── mat/                  # MAT モデル関連ファイル
 │   └── image_utils.py        # 画像処理ユーティリティ
-├── beard_inpainting_modules/ # v4 モジュール（色調補正機能含む）
+├── beard_inpainting_modules/ # 髭除去モジュール
 │   ├── __init__.py
-│   ├── image_handler.py      # 画像I/O
-│   ├── region_selector.py    # 矩形選択
-│   ├── beard_detector.py     # 検出ロジック
-│   ├── highlighter.py        # 選択・表示
-│   ├── inpainter.py          # LaMa wrapper
-│   ├── color_corrector.py    # 色調補正（青髭補正）
-│   └── pipeline.py           # オーケストレーター
+│   ├── pipeline.py           # オーケストレーター
+│   ├── inpainter.py          # Inpainting wrapper
+│   ├── mat_inpainter.py      # MAT Inpainting wrapper
+│   └── region_selector.py    # 領域選択
+├── checkpoints/              # チェックポイント
+│   └── mat/                  # MAT モデル
+│       ├── MAT_FFHQ_512_fp16.safetensors      # FFHQ モデル
+│       └── MAT_CelebA-HQ_512_fp16.safetensors # CelebA-HQ モデル
 ├── requirements.txt          # 依存パッケージ一覧
 └── README.md                 # このファイル
 ```
@@ -77,47 +101,46 @@ image-inpainting/
     ※ 親フォルダに配置しても自動検出されます
 ```
 
-### 不要なファイル（削除可能）
-
-以下は旧バージョンまたは開発用ファイルです：
-
-```
-image-inpainting/
-├── app.py                    # 旧バージョン
-├── app_gradio.py             # v1
-├── app_gradio_v2.py          # v2
-├── beard_grounded_sam.py     # OpenCV版（参考実装）
-├── ui/                       # 未使用UIコンポーネント
-└── *.png                     # テスト出力画像
-```
-
-### 参考: 親フォルダの構成
-
-```
-image_inpaintin+SAM_移管用/
-├── image-inpainting/         # ← このアプリ
-├── GroundingDINO/            # ※ pip install groundingdino-py で不要に
-├── groundingdino_swint_ogc.pth  # チェックポイント（ここでも検出可能）
-├── sam_vit_b_01ec64.pth      # SAM ViT-B（軽量版、オプション）
-└── experimental/             # 実験用コード
-```
-
 ## 使い方
 
-### 起動
+### クイックスタート（コマンドライン）
+
+```bash
+# 1. プロジェクトディレクトリに移動
+cd image-inpainting
+
+# 2. Python 3.12 仮想環境を作成
+python3.12 -m venv venv
+
+# 3. 仮想環境を有効化
+source venv/bin/activate
+
+# 4. 依存パッケージをインストール
+pip install gradio numpy opencv-python pillow torch torchvision
+pip install simple-lama-inpainting
+
+# 5. アプリを起動
+cd image-inpainting
+python app_gradio_v6.py
+```
+
+ブラウザで http://127.0.0.1:7867 を開いてアプリを使用できます。
+
+### 2回目以降の起動
 
 ```bash
 cd image-inpainting
-
-# v3（従来版）
-python app_gradio_v3.py  # Port 7863
-
-# v4（モジュラー版 + 色調補正機能）
-python app_gradio_v4.py  # Port 7864
+source venv/bin/activate
+cd image-inpainting
+python app_gradio_v6.py
 ```
 
-- v3: `http://127.0.0.1:7863`
-- v4: `http://127.0.0.1:7864`
+### デバイス（GPU/CPU）
+
+アプリは以下の優先順位でデバイスを自動選択します：
+1. **MPS** (Apple Silicon Mac)
+2. **CUDA** (NVIDIA GPU)
+3. **CPU** (フォールバック)
 
 ### 起動時のログメッセージ
 
@@ -164,7 +187,8 @@ DeprecationWarning: The 'theme' parameter...
 #### Tab 1: 髭検出
 
 1. **画像をアップロード**
-2. **髭の範囲を矩形で囲む**（白色ブラシで塗りつぶし）
+2. **髭の範囲を選択**
+   - 矩形で塗りつぶし、または座標入力で指定
 3. **検出モードを選択**
    - ルールベース（1本ずつ検出）: 推奨、高精度
    - Grounded SAM: テキストプロンプトベース
@@ -174,15 +198,27 @@ DeprecationWarning: The 'theme' parameter...
    - スライダーで削除割合を指定
    - 選択モード: ランダム / 面積大 / 面積小 / 信頼度順
    - 削除対象は赤色で強調表示
+   - **残りの髭はTab 3でオーバーレイ可能**
 6. **「マスクを Tab 2 に転送」をクリック**
 
-#### Tab 2: LaMa 髭除去
+#### Tab 2: 髭除去（MAT / LaMa）
 
-1. **薄め具合を選択**（30%, 50%, 70%, 100%）
-2. **「髭薄めを実行」をクリック**
-3. **結果をギャラリーで確認・ダウンロード**
+1. **インペインティング手法を選択**
+   - **MAT (FFHQ - 顔専用)**: 顔画像に最適化（v6推奨）
+   - **MAT (CelebA-HQ - 顔専用)**: 別のプリトレーニングモデル
+   - Simple LaMa: 汎用的なInpainting
+   - OpenCV Telea / Navier-Stokes: 軽量な従来手法
+2. **MAT強化モード設定**（MAT使用時）
+   - テクスチャ強度: 元画像の肌の質感をどれだけ復元するか
+   - 青髭補正強度: 青みをどれだけ除去するか
+3. **薄め具合を選択**（30%, 50%, 70%, 100%）
+4. **「髭薄めを実行」をクリック**
+5. **結果をギャラリーで確認・ダウンロード**
 
-#### Tab 3: 色調補正（v4のみ）
+**手動マスク編集:**
+Tab 1のマスクを使わず、直接ブラシで描画して領域指定も可能です。
+
+#### Tab 3: 色調補正 + 髭オーバーレイ
 
 1. **Tab 2の結果を取得**（自動転送 or 「← Tab 2の結果を取得」ボタン）
 2. **補正モードを選択**（青み除去がおすすめ）
@@ -190,7 +226,52 @@ DeprecationWarning: The 'theme' parameter...
    - 「手動で塗る」: エディタで青髭部分を赤ブラシで塗る
    - 「Tab 1の選択マスクを使用」: 検出済みのマスクを再利用
 4. **LABパラメータを調整**（必要に応じて）
-5. **「色調補正を適用」をクリック**
+5. **髭オーバーレイを設定**（v5新機能）
+   - 「髭オーバーレイを有効化」にチェック
+   - オーバーレイ強度を調整（1.0 = 完全に元の髭）
+   - エッジぼかしで境界を滑らかに
+6. **「色調補正 + オーバーレイを適用」をクリック**
+
+##### 髭オーバーレイ機能
+
+Tab 1で「削除対象」として選ばなかった髭を、色補正後の画像に重ねます。
+
+**仕組み:**
+```
+残す髭マスク = 全検出マスク - 削除対象マスク
+最終出力 = 色補正画像 × (1 - マスク) + 元画像 × マスク
+```
+
+**効果:**
+- 青みが消えた肌 + 本来の髭 = 自然な髭の薄め効果
+- 完全除去ではなく、自然に薄くなった見た目を実現
+
+##### マスク隙間埋め機能
+
+検出マスクが点々に見える場合、隙間を埋めて滑らかに補正できます。
+
+**使い方:**
+1. 「マスク隙間埋め設定」アコーディオンを開く
+2. 「隙間埋めを有効化」にチェック
+3. 隙間埋めサイズとエッジぼかしを調整
+
+##### 除外マスク機能
+
+周辺の青みを含む領域を参照から除外し、より自然な色補正を行う機能です。
+
+**使い方:**
+1. 「除外マスク設定」アコーディオンを開く
+2. 「除外マスクを有効化」にチェック
+3. 除外領域を指定（以下のいずれか）:
+   - **手動で塗る**: 青ブラシで青髭が広がっている部分を塗る
+   - **Tab 1マスクを使用**: 「← Tab 1の全検出マスクを除外に追加」ボタン
+4. 「色調補正 + オーバーレイを適用」をクリック
+
+**動作原理:**
+```
+色補正対象 = 対象マスク（髭検出・点々）∪ 除外マスク（青髭領域）
+参照サンプリング = 周辺肌色 − 除外マスク（青みを含む領域を除外）
+```
 
 ## パラメータ説明
 
@@ -210,29 +291,26 @@ DeprecationWarning: The 'theme' parameter...
 | Box Threshold | 0.25 | ボックス検出の信頼度閾値 |
 | Text Threshold | 0.20 | テキストマッチングの閾値 |
 
-### 色調補正（v4 Tab 3）- 最適な肌色補正
+### MAT Inpainting（Tab 2）
+
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| インペインティング手法 | MAT (FFHQ) | FFHQ: 一般的な顔画像、CelebA-HQ: 有名人の顔画像 |
+| MAT強化モード | ON | テクスチャ保持 + 青髭補正を有効化 |
+| テクスチャ強度 | 0.8 | 元画像の肌の質感をどれだけ復元するか |
+| 青髭補正強度 | 0.7 | 青みをどれだけ除去するか |
+
+### 色調補正（Tab 3）
 
 LAB色空間を使用して青髭を自然な肌色に補正します。
 
-#### パラメータ調整の経緯
+#### LABパラメータ
 
-色調補正のLABパラメータは、実際のテスト画像を使用して最適化されました。
-
-**変更前（初期値）:**
-| パラメータ | 値 | 説明 |
-|-----------|-----|------|
-| a* 調整係数 | 100% (1.0) | 赤-緑軸の調整 |
-| b* 調整係数 | 100% (1.0) | 青-黄軸の調整 |
-| L 調整係数 | 70% (0.7) | 明度の調整 |
-
-初期値では色調整が強すぎて、補正後の肌がオレンジ/暖色に偏りすぎる問題がありました。
-
-**変更後（最適な肌色補正）:**
-| パラメータ | 値 | 説明 |
-|-----------|-----|------|
-| a* 調整係数 | **30% (0.3)** | 赤みの追加を最小限に抑制（オレンジ化防止） |
-| b* 調整係数 | **60% (0.6)** | 青み除去を控えめに（自然な色味を維持） |
-| L 調整係数 | **50% (0.5)** | 明度の上げすぎを抑制 |
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| a* 調整係数 | 30% (0.3) | 赤みの追加を最小限に抑制（オレンジ化防止） |
+| b* 調整係数 | 60% (0.6) | 青み除去を控えめに（自然な色味を維持） |
+| L 調整係数 | 50% (0.5) | 明度の上げすぎを抑制 |
 
 この設定により、元の肌色・テクスチャを保持しながら青髭を自然に補正できます。
 
@@ -243,6 +321,13 @@ LAB色空間を使用して青髭を自然な肌色に補正します。
 | **青み除去（推奨）** | 青髭補正 | 不要 |
 | 色味転送 | 汎用色補正 | 必要 |
 | 自動補正 | 手軽な補正 | 不要 |
+
+### 髭オーバーレイ（Tab 3）
+
+| パラメータ | デフォルト | 説明 |
+|-----------|-----------|------|
+| オーバーレイ強度 | 1.0 | 1.0 = 完全に元の髭、0.5 = 半透明 |
+| エッジぼかし | 3 | 髭の境界をぼかして自然に馴染ませる |
 
 ## トラブルシューティング
 
@@ -268,7 +353,8 @@ pip install groundingdino-py
 
 ## 技術スタック
 
-- **Gradio**: Web UI フレームワーク
+- **Gradio 5.x**: Web UI フレームワーク
+- **MAT (Mask-Aware Transformer)**: CVPR 2022 Best Paper Finalist の高品質Inpainting
 - **OpenCV**: 画像処理（ルールベース検出）
 - **SimpleLama**: LaMa ベースの Inpainting
 - **Segment Anything (SAM)**: セグメンテーション（オプション）
