@@ -4,7 +4,15 @@ from PIL import Image
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 import torch
-from simple_lama_inpainting import SimpleLama
+
+# Check if simple-lama-inpainting is available
+SIMPLE_LAMA_AVAILABLE = False
+SimpleLama = None
+try:
+    from simple_lama_inpainting import SimpleLama
+    SIMPLE_LAMA_AVAILABLE = True
+except ImportError:
+    pass
 
 from core.image_utils import (
     numpy_to_pil,
