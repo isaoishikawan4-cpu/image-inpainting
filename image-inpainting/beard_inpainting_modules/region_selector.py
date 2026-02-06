@@ -159,6 +159,11 @@ class RegionSelector:
         """
         線で囲まれた領域を塗りつぶす。
 
+        フラッドフィル方式: 画像の端から背景を塗りつぶし、
+        反転して線で囲まれた内部領域を取得する。
+        これにより、線が完全に閉じていなくても、
+        おおよそ囲まれた領域を検出できる。
+
         Args:
             mask: 線が描かれたバイナリマスク
 
@@ -168,25 +173,63 @@ class RegionSelector:
         # バイナリ化
         mask_binary = (mask > 128).astype(np.uint8) * 255
 
-        # 線を少し太くして隙間を埋める
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask_dilated = cv2.dilate(mask_binary, kernel, iterations=1)
+        # 線を太くして隙間を埋める（より積極的に）
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        mask_dilated = cv2.dilate(mask_binary, kernel, iterations=2)
 
-        # 輪郭を検出
-        contours, _ = cv2.findContours(
-            mask_dilated,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
-        )
+        h, w = mask_dilated.shape
 
-        if not contours:
-            return mask_binary
+        # フラッドフィル用のマスク（元画像より2ピクセル大きい必要がある）
+        flood_mask = np.zeros((h + 2, w + 2), np.uint8)
 
-        # 塗りつぶし用の新しいマスクを作成
+        # 背景塗りつぶし用の画像を作成
+        flood_img = mask_dilated.copy()
+
+        # 画像の四隅からフラッドフィルを実行して背景を塗りつぶす
+        # これにより、線で囲まれた内部は塗りつぶされない
+        corners = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+        for cx, cy in corners:
+            if flood_img[cy, cx] == 0:  # 背景（黒）の場合のみ
+                cv2.floodFill(flood_img, flood_mask, (cx, cy), 128)
+
+        # 端からもフラッドフィル（四隅だけでは不十分な場合）
+        # 上端
+        for x in range(0, w, 10):
+            if flood_img[0, x] == 0:
+                cv2.floodFill(flood_img, flood_mask, (x, 0), 128)
+        # 下端
+        for x in range(0, w, 10):
+            if flood_img[h - 1, x] == 0:
+                cv2.floodFill(flood_img, flood_mask, (x, h - 1), 128)
+        # 左端
+        for y in range(0, h, 10):
+            if flood_img[y, 0] == 0:
+                cv2.floodFill(flood_img, flood_mask, (0, y), 128)
+        # 右端
+        for y in range(0, h, 10):
+            if flood_img[y, w - 1] == 0:
+                cv2.floodFill(flood_img, flood_mask, (w - 1, y), 128)
+
+        # 塗りつぶされなかった領域（=線で囲まれた内部）を抽出
+        # flood_img: 128=背景, 255=線, 0=内部
         filled_mask = np.zeros_like(mask_binary)
+        filled_mask[flood_img == 0] = 255  # 内部領域
+        filled_mask[flood_img == 255] = 255  # 線自体も含める
 
-        # すべての輪郭を塗りつぶす
-        cv2.drawContours(filled_mask, contours, -1, 255, -1)  # -1 = 塗りつぶし
+        # 小さな穴を埋める
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        filled_mask = cv2.morphologyEx(filled_mask, cv2.MORPH_CLOSE, kernel_close)
+
+        # 結果が空の場合は、従来の輪郭ベースの方法にフォールバック
+        if np.sum(filled_mask > 0) < 100:
+            contours, _ = cv2.findContours(
+                mask_dilated,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE
+            )
+            if contours:
+                filled_mask = np.zeros_like(mask_binary)
+                cv2.drawContours(filled_mask, contours, -1, 255, -1)
 
         return filled_mask
 

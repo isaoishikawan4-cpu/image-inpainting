@@ -18,6 +18,8 @@ class InpaintingMethod(Enum):
     LAMA = "lama"                      # Simple LaMa (deep learning)
     OPENCV_TELEA = "opencv_telea"      # OpenCV Telea method
     OPENCV_NS = "opencv_ns"            # OpenCV Navier-Stokes method
+    MAT_FFHQ = "mat_ffhq"              # MAT with FFHQ model (face)
+    MAT_CELEBA = "mat_celeba"          # MAT with CelebA-HQ model (face)
 
 # Check if core inpainting is available
 LAMA_AVAILABLE = False

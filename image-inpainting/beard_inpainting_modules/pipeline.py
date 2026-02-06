@@ -14,6 +14,7 @@ from .region_selector import RegionSelector, SelectionShape
 from .beard_detector import BeardDetector, DetectionBackend
 from .highlighter import BeardRegionManager, SelectionMode
 from .inpainter import LamaInpainter, OpenCVInpainter, InpaintingMethod
+from .mat_inpainter import MATInpainter
 from .color_corrector import SkinColorCorrector, CorrectionMode, MaskType
 
 
@@ -30,6 +31,8 @@ class BeardRemovalPipeline:
         self._region_manager = BeardRegionManager()
         self._inpainter = LamaInpainter()
         self._opencv_inpainter = OpenCVInpainter()
+        self._mat_inpainter_ffhq = MATInpainter(model_type="ffhq")
+        self._mat_inpainter_celeba = MATInpainter(model_type="celeba")
         self._color_corrector = SkinColorCorrector()
         self._current_image: Optional[np.ndarray] = None
         self._last_inpaint_result: Optional[np.ndarray] = None
@@ -272,7 +275,10 @@ class BeardRemovalPipeline:
         thinning_levels: List[int],
         progress=None,
         method: str = "lama",
-        opencv_radius: int = 3
+        opencv_radius: int = 3,
+        mat_enhanced: bool = False,
+        texture_strength: float = 0.8,
+        color_correction_strength: float = 0.7
     ) -> Tuple[List[Tuple[Image.Image, str]], str]:
         """
         Process inpainting (Tab 2 main function).
@@ -282,8 +288,11 @@ class BeardRemovalPipeline:
             mask: Binary mask
             thinning_levels: List of levels [30, 50, 70, 100]
             progress: Gradio progress tracker
-            method: "lama", "opencv_telea", or "opencv_ns"
+            method: "lama", "opencv_telea", "opencv_ns", "mat_ffhq", or "mat_celeba"
             opencv_radius: Inpainting radius for OpenCV methods (1-20)
+            mat_enhanced: MAT強化モード（テクスチャ保持+青髭補正）
+            texture_strength: テクスチャ復元強度 (0.0-1.0)
+            color_correction_strength: 色補正強度 (0.0-1.0)
 
         Returns:
             (gallery_items, status_message)
@@ -297,7 +306,21 @@ class BeardRemovalPipeline:
                     pass
 
         # Select inpainting method
-        if method == "opencv_telea":
+        if method == "mat_ffhq":
+            return self._mat_inpainter_ffhq.process_thinning_levels(
+                image, mask, thinning_levels, progress_callback,
+                enhanced_mode=mat_enhanced,
+                texture_strength=texture_strength,
+                color_correction_strength=color_correction_strength
+            )
+        elif method == "mat_celeba":
+            return self._mat_inpainter_celeba.process_thinning_levels(
+                image, mask, thinning_levels, progress_callback,
+                enhanced_mode=mat_enhanced,
+                texture_strength=texture_strength,
+                color_correction_strength=color_correction_strength
+            )
+        elif method == "opencv_telea":
             self._opencv_inpainter.set_method(InpaintingMethod.OPENCV_TELEA)
             self._opencv_inpainter.set_radius(opencv_radius)
             return self._opencv_inpainter.process_thinning_levels(
