@@ -7,7 +7,7 @@ This module provides utilities for converting between different image formats
 import numpy as np
 import cv2
 from PIL import Image
-from typing import Union
+from typing import Optional, Union
 
 
 class ImageHandler:
@@ -131,3 +131,43 @@ class ImageHandler:
         # Binarize
         binary_mask = np.where(mask > threshold, 255, 0).astype(np.uint8)
         return binary_mask
+
+    @staticmethod
+    def extract_image_from_editor(editor_data: dict) -> Optional[np.ndarray]:
+        """
+        Extract RGB numpy image from Gradio ImageEditor data.
+
+        Handles:
+        - Extracting from 'background' key (preferred) or 'composite' key
+        - PIL.Image to numpy conversion
+        - Grayscale to RGB conversion
+        - RGBA to RGB conversion
+
+        Args:
+            editor_data: Dictionary from gr.ImageEditor
+
+        Returns:
+            RGB numpy array (H, W, 3) or None if no valid image found
+        """
+        if editor_data is None:
+            return None
+
+        if 'background' in editor_data:
+            image = editor_data['background']
+        elif 'composite' in editor_data:
+            image = editor_data['composite']
+        else:
+            return None
+
+        if image is None:
+            return None
+
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+
+        return image

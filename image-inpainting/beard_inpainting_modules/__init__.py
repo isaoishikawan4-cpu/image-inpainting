@@ -41,6 +41,15 @@ from .black_white_hair_detector import (
     HairClassParams,
 )
 
+# Hair thickness classification
+from .thickness_classifier import (
+    THICKNESS_CATEGORIES,
+    ClassifiedHair,
+    calculate_hair_width,
+    classify_hair_thickness,
+    visualize_classified_hairs,
+)
+
 # Morphology utilities
 from .morphology_utils import (
     extract_skeleton,
@@ -77,6 +86,13 @@ __all__ = [
     # Black/White Hair Detection
     'BlackWhiteHairDetector',
     'HairClassParams',
+
+    # Hair Thickness Classification
+    'THICKNESS_CATEGORIES',
+    'ClassifiedHair',
+    'calculate_hair_width',
+    'classify_hair_thickness',
+    'visualize_classified_hairs',
 
     # Morphology Utilities
     'extract_skeleton',

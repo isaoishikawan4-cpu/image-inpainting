@@ -1,14 +1,28 @@
 """
-Single Hair Detection v3 - Hair Thickness Classification
 
-This app extends v2 with hair thickness classification:
-- 剛毛 (Coarse): Very thick hair
-- 硬毛 (Thick): Thick hair
-- 中間毛 (Medium): Medium thickness hair
-- 軟毛 (Fine): Fine/thin hair
+1. 毛質別のカウント:
+   SAMで検出した髭を太さ（幅）に基づいて4種類に分類:
+   - 剛毛: 赤
+   - 硬毛: オレンジ
+   - 中間毛: 緑
+   - 軟毛: 紫
 
-Classification is based on the minimum bounding rectangle width of each detected hair.
-Uses SAM (Segment Anything Model) for detection.
+2. 色別のカウント:
+   髭を色（明るさ）で分類してカウント:
+   - 黒髭: 肌より暗い髭を検出
+   - 白髭: 肌より明るい髭を検出
+
+   明るさの閾値 パラメータ:
+   - 黒髭 (デフォルト: 1.14, 範囲: 0.80-1.30):
+     マスクの明るさ < ROI平均 × 閾値 で検出。
+     値を上げると、より明るい髭も許容（検出数増加）。
+   - 白髭 (デフォルト: 0.95, 範囲: 0.70-1.20):
+     マスクの明るさ > ROI平均 × 閾値 で検出。
+     値を下げると、より暗い髭も許容（検出数増加）。
+
+   最小/最大面積: マスクのピクセル面積でフィルタ。
+   最小アスペクト比: 細長さでフィルタ（1.0=すべて許可, 2.0=細長いもののみ）。
+   膨張処理: 検出マスクを膨張させて隣接ピクセルを含める（0=OFF）。
 
 Usage:
     python app_single_hair_edge_v3.py
@@ -21,127 +35,70 @@ Requirements:
 
 import gradio as gr
 import numpy as np
-from PIL import Image
 import cv2
 from typing import Optional, Tuple, List
-from dataclasses import dataclass
 
 from beard_inpainting_modules import (
     RegionSelector,
     DetectedRegion,
     BlackWhiteHairDetector,
     HairClassParams,
+    ImageHandler,
+    visualize_single_hairs,
+    # Thickness classification
+    THICKNESS_CATEGORIES,
+    ClassifiedHair,
+    calculate_hair_width,
+    classify_hair_thickness,
+    visualize_classified_hairs,
 )
 
-
-# Hair thickness categories with colors (RGB for Gradio display)
-THICKNESS_CATEGORIES = {
-    "剛毛": {"color": (255, 0, 0), "label_en": "Coarse"},       # Red
-    "硬毛": {"color": (255, 165, 0), "label_en": "Thick"},      # Orange
-    "中間毛": {"color": (0, 200, 0), "label_en": "Medium"},     # Green
-    "軟毛": {"color": (148, 0, 211), "label_en": "Fine"},       # Purple (Dark Violet)
-}
-
-
-@dataclass
-class ClassifiedHair:
-    """A detected hair with thickness classification."""
-    detection: DetectedRegion
-    width: float
-    category: str
-
-
-def classify_hair_thickness(
-    width: float,
-    threshold_coarse: float,
-    threshold_thick: float,
-    threshold_medium: float
-) -> str:
-    """Classify hair based on width thresholds."""
-    if width >= threshold_coarse:
-        return "剛毛"
-    elif width >= threshold_thick:
-        return "硬毛"
-    elif width >= threshold_medium:
-        return "中間毛"
-    else:
-        return "軟毛"
-
-
-def calculate_hair_width(mask: np.ndarray) -> float:
-    """Calculate hair width from mask using minAreaRect."""
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return 0.0
-
-    largest_contour = max(contours, key=cv2.contourArea)
-    rect = cv2.minAreaRect(largest_contour)
-    w_rect, h_rect = rect[1]
-
-    if w_rect == 0 or h_rect == 0:
-        return 0.0
-
-    return min(w_rect, h_rect)
-
-
-def visualize_classified_hairs(
-    image: np.ndarray,
-    classified_hairs: List[ClassifiedHair],
-    alpha: float = 0.4,
-    show_markers: bool = True
-) -> np.ndarray:
-    """Visualize hairs with category-based colors."""
-    result = image.copy()
-    overlay = np.zeros_like(image)
-
-    for hair in classified_hairs:
-        color = THICKNESS_CATEGORIES[hair.category]["color"]
-        mask_bool = hair.detection.mask > 0
-        overlay[mask_bool] = color
-
-        if show_markers:
-            cx, cy = hair.detection.centroid
-            cv2.circle(result, (cx, cy), 2, color, -1)
-
-    mask_any = np.any(overlay > 0, axis=2)
-    result[mask_any] = cv2.addWeighted(
-        result[mask_any], 1 - alpha,
-        overlay[mask_any], alpha,
-        0
-    )
-
-    return result
-
-
 class EdgeDetectionAppV3:
-    """Gradio application v3 for hair thickness classification."""
+    """Gradio application v3 for hair thickness classification and black/white count."""
 
     def __init__(self):
         self._detector = BlackWhiteHairDetector()
         self._current_image: Optional[np.ndarray] = None
         self._classified_hairs: List[ClassifiedHair] = []
+        self._detections: List[DetectedRegion] = []
         self._freeform_mask: Optional[np.ndarray] = None
+        self._last_mode: str = "毛質別のカウント"
 
     def detect_and_classify(
         self,
         editor_data: dict,
+        detection_mode: str,
         hair_class: str,
         # SAM params
         sam_points_per_side: int,
         use_tiling: bool,
         tile_size: int,
         tile_overlap: int,
-        # Filter params (inherited from v2)
+        # Thickness mode: filter params
         min_area: int,
         max_area: int,
         min_aspect: float,
         brightness_threshold: float,
         dilation_kernel: int,
         dilation_iterations: int,
-        # Thickness thresholds (v3 new)
+        # Thickness mode: thickness thresholds
         threshold_coarse: float,
         threshold_thick: float,
         threshold_medium: float,
+        # BW Count mode: black params
+        black_min_area: int,
+        black_max_area: int,
+        black_min_aspect: float,
+        black_brightness_threshold: float,
+        black_dilation_kernel: int,
+        black_dilation_iterations: int,
+        # BW Count mode: white params
+        white_min_area: int,
+        white_max_area: int,
+        white_min_aspect: float,
+        white_brightness_threshold: float,
+        white_dilation_kernel: int,
+        white_dilation_iterations: int,
         # Duplicate removal
         overlap_threshold: float,
         # Region selection
@@ -158,36 +115,21 @@ class EdgeDetectionAppV3:
 
         Returns:
             result_image: Detection result with category colors
-            category_mask: Category-colored mask
+            category_mask: Category-colored mask (thickness mode) or None (bw_count mode)
             all_mask: All SAM masks (before filtering)
-            filtered_mask: Filtered masks (after filtering, before category coloring)
+            filtered_mask: Filtered masks (after filtering)
             count_display: Category counts text
             status: Status text
         """
 
-        if editor_data is None:
-            return None, None, None, None, "0", "Please upload an image first"
-
-        if 'background' in editor_data:
-            image = editor_data['background']
-        elif 'composite' in editor_data:
-            image = editor_data['composite']
-        else:
-            return None, None, None, None, "0", "Invalid image data"
-
+        # Extract image from editor
+        image = ImageHandler.extract_image_from_editor(editor_data)
         if image is None:
-            return None, None, None, None, "0", "No image found"
-
-        if isinstance(image, Image.Image):
-            image = np.array(image)
-
-        if len(image.shape) == 2:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-        elif image.shape[2] == 4:
-            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+            return None, None, None, None, "0", "画像をアップロードしてください"
 
         self._current_image = image
         self._freeform_mask = None
+        self._last_mode = detection_mode
         h, w = image.shape[:2]
 
         # Extract region based on selection mode
@@ -230,16 +172,41 @@ class EdgeDetectionAppV3:
                 return image, None, None, None, "0", f"Invalid coordinates: ({x1},{y1})-({x2},{y2})"
             rect = (x1, y1, x2, y2)
 
-        # Set up detection parameters (inherited from v2)
-        params = HairClassParams(
-            min_area=min_area,
-            max_area=max_area,
-            min_aspect=min_aspect,
-            brightness_threshold=brightness_threshold,
-            brightness_mode='darker' if hair_class == 'black' else 'brighter',
-            dilation_kernel_size=dilation_kernel,
-            dilation_iterations=dilation_iterations,
-        )
+        # Build HairClassParams based on detection mode
+        if detection_mode == "色別のカウント":
+            if hair_class == "black":
+                params = HairClassParams(
+                    min_area=black_min_area,
+                    max_area=black_max_area,
+                    min_aspect=black_min_aspect,
+                    brightness_threshold=black_brightness_threshold,
+                    brightness_mode='darker',
+                    dilation_kernel_size=black_dilation_kernel,
+                    dilation_iterations=black_dilation_iterations,
+                )
+                current_max_area = black_max_area
+            else:
+                params = HairClassParams(
+                    min_area=white_min_area,
+                    max_area=white_max_area,
+                    min_aspect=white_min_aspect,
+                    brightness_threshold=white_brightness_threshold,
+                    brightness_mode='brighter',
+                    dilation_kernel_size=white_dilation_kernel,
+                    dilation_iterations=white_dilation_iterations,
+                )
+                current_max_area = white_max_area
+        else:  # 毛質別のカウント
+            params = HairClassParams(
+                min_area=min_area,
+                max_area=max_area,
+                min_aspect=min_aspect,
+                brightness_threshold=brightness_threshold,
+                brightness_mode='darker' if hair_class == 'black' else 'brighter',
+                dilation_kernel_size=dilation_kernel,
+                dilation_iterations=dilation_iterations,
+            )
+            current_max_area = max_area
 
         # Run SAM detection
         if selection_mode == "freeform" and freeform_mask is not None:
@@ -261,31 +228,13 @@ class EdgeDetectionAppV3:
                 overlap_threshold=overlap_threshold,
             )
 
-        # Classify detected hairs by thickness
-        self._classified_hairs = []
-        category_counts = {"剛毛": 0, "硬毛": 0, "中間毛": 0, "軟毛": 0}
-        width_stats = []
-
-        for det in detections:
-            width = calculate_hair_width(det.mask)
-            category = classify_hair_thickness(
-                width, threshold_coarse, threshold_thick, threshold_medium
-            )
-            self._classified_hairs.append(ClassifiedHair(
-                detection=det,
-                width=width,
-                category=category
-            ))
-            category_counts[category] += 1
-            width_stats.append(width)
-
         # Create All Masks visualization (before filtering)
         all_mask_vis = np.zeros((h, w, 3), dtype=np.uint8)
         if len(all_masks) > 0:
             masks_with_area = []
             for mask in all_masks:
                 area = cv2.countNonZero(mask)
-                if area <= max_area:
+                if area <= current_max_area:
                     masks_with_area.append((mask, area))
 
             masks_with_area.sort(key=lambda x: x[1], reverse=True)
@@ -310,6 +259,63 @@ class EdgeDetectionAppV3:
                 color = tuple(int(c) for c in rgb)
                 mask_bool = det.mask > 0
                 filtered_mask_vis[mask_bool] = color
+
+        # Branch based on detection mode
+        if detection_mode == "色別のカウント":
+            return self._process_bw_count_mode(
+                image, detections, all_mask_vis, filtered_mask_vis, stats,
+                hair_class, selection_mode, freeform_mask,
+                x1, y1, x2, y2, sam_points_per_side, use_tiling,
+                overlay_alpha, show_markers,
+            )
+        else:
+            return self._process_thickness_mode(
+                image, detections, all_mask_vis, filtered_mask_vis, stats,
+                hair_class, selection_mode, freeform_mask,
+                x1, y1, x2, y2, sam_points_per_side,
+                threshold_coarse, threshold_thick, threshold_medium,
+                overlay_alpha, show_markers,
+            )
+
+    def _process_thickness_mode(
+        self,
+        image: np.ndarray,
+        detections: List[DetectedRegion],
+        all_mask_vis: np.ndarray,
+        filtered_mask_vis: np.ndarray,
+        stats: dict,
+        hair_class: str,
+        selection_mode: str,
+        freeform_mask: Optional[np.ndarray],
+        x1: int, y1: int, x2: int, y2: int,
+        sam_points_per_side: int,
+        threshold_coarse: float,
+        threshold_thick: float,
+        threshold_medium: float,
+        overlay_alpha: float,
+        show_markers: bool,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], np.ndarray, np.ndarray, str, str]:
+        """Process detections in thickness classification mode."""
+        h, w = image.shape[:2]
+
+        # Classify detected hairs by thickness
+        self._classified_hairs = []
+        self._detections = []
+        category_counts = {"剛毛": 0, "硬毛": 0, "中間毛": 0, "軟毛": 0}
+        width_stats = []
+
+        for det in detections:
+            width = calculate_hair_width(det.mask)
+            category = classify_hair_thickness(
+                width, threshold_coarse, threshold_thick, threshold_medium
+            )
+            self._classified_hairs.append(ClassifiedHair(
+                detection=det,
+                width=width,
+                category=category
+            ))
+            category_counts[category] += 1
+            width_stats.append(width)
 
         # Create visualization
         if len(self._classified_hairs) > 0:
@@ -352,7 +358,7 @@ class EdgeDetectionAppV3:
         mode_label = mode_labels.get(selection_mode, selection_mode)
 
         status_lines = [
-            f"【{class_label}】 総検出数: {total}",
+            f"【毛質別のカウント - {class_label}】 総検出数: {total}",
             f"選択モード: {mode_label}",
             f"Region: ({x1},{y1})-({x2},{y2}) = {x2-x1}x{y2-y1}px",
             "",
@@ -383,7 +389,6 @@ class EdgeDetectionAppV3:
 
         status = "\n".join(status_lines)
 
-        # Count display
         count_display = (
             f"総数:{total} | "
             f"剛毛:{category_counts['剛毛']} | "
@@ -394,31 +399,102 @@ class EdgeDetectionAppV3:
 
         return result_image, category_mask_vis, all_mask_vis, filtered_mask_vis, count_display, status
 
+    def _process_bw_count_mode(
+        self,
+        image: np.ndarray,
+        detections: List[DetectedRegion],
+        all_mask_vis: np.ndarray,
+        filtered_mask_vis: np.ndarray,
+        stats: dict,
+        hair_class: str,
+        selection_mode: str,
+        freeform_mask: Optional[np.ndarray],
+        x1: int, y1: int, x2: int, y2: int,
+        sam_points_per_side: int,
+        use_tiling: bool,
+        overlay_alpha: float,
+        show_markers: bool,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], np.ndarray, np.ndarray, str, str]:
+        """Process detections in black/white count mode."""
+        self._detections = detections
+        self._classified_hairs = []
+
+        # Create visualization using rainbow colors
+        if len(detections) > 0:
+            result_image = visualize_single_hairs(
+                image, detections,
+                alpha=overlay_alpha,
+                show_markers=show_markers
+            )
+
+            # Draw region outline
+            if selection_mode == "freeform" and freeform_mask is not None:
+                mask_overlay = np.zeros_like(result_image)
+                mask_overlay[freeform_mask > 0] = (0, 255, 255)
+                result_image = cv2.addWeighted(result_image, 1.0, mask_overlay, 0.15, 0)
+                contours, _ = cv2.findContours(
+                    freeform_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                cv2.drawContours(result_image, contours, -1, (255, 255, 255), 2)
+            else:
+                cv2.rectangle(result_image, (x1, y1), (x2, y2), (255, 255, 255), 2)
+        else:
+            result_image = image.copy()
+            if selection_mode == "freeform" and freeform_mask is not None:
+                mask_overlay = np.zeros_like(result_image)
+                mask_overlay[freeform_mask > 0] = (0, 255, 255)
+                result_image = cv2.addWeighted(result_image, 1.0, mask_overlay, 0.15, 0)
+                contours, _ = cv2.findContours(
+                    freeform_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                cv2.drawContours(result_image, contours, -1, (255, 255, 255), 2)
+            else:
+                cv2.rectangle(result_image, (x1, y1), (x2, y2), (255, 255, 255), 2)
+
+        # Build status text
+        class_label = "黒髭 (Black)" if hair_class == "black" else "白髭 (White)"
+        mode_labels = {"freeform": "フリーハンド", "rectangle": "矩形", "coordinates": "座標入力"}
+        mode_label = mode_labels.get(selection_mode, selection_mode)
+        tiles_info = f", tiles={stats.get('tiles', 1)}" if use_tiling else ""
+
+        status_lines = [
+            f"【色別のカウント - {class_label}】 検出数: {len(detections)}",
+            f"選択モード: {mode_label}",
+        ]
+
+        if selection_mode == "freeform" and freeform_mask is not None:
+            mask_pixels = int(np.sum(freeform_mask > 0))
+            status_lines.append(f"Mask area: {mask_pixels} pixels (黄色で表示)")
+
+        status_lines.extend([
+            f"Region: ({x1},{y1})-({x2},{y2}) = {x2-x1}x{y2-y1}px",
+            f"Total masks: {stats['total']} (points_per_side={sam_points_per_side}{tiles_info})",
+            f"Filtered: area_small={stats['filtered_area_small']}, "
+            f"area_large={stats['filtered_area_large']}, "
+            f"aspect={stats['filtered_aspect']}, "
+            f"brightness={stats['filtered_brightness']}",
+        ])
+
+        if selection_mode == "freeform":
+            status_lines.append(f"  outside_mask={stats.get('filtered_outside_mask', 0)}")
+
+        if 'mean_brightness' in stats:
+            status_lines.append(f"Mean brightness: {stats['mean_brightness']:.1f}")
+
+        status = "\n".join(status_lines)
+        count_display = f"検出数: {len(detections)}"
+
+        # category_mask is None for bw_count mode
+        return result_image, None, all_mask_vis, filtered_mask_vis, count_display, status
+
     def preview_region(
         self, editor_data: dict,
         coord_x1: int, coord_y1: int, coord_x2: int, coord_y2: int
     ) -> Optional[np.ndarray]:
         """Preview the selected region."""
-        if editor_data is None:
-            return None
-
-        if 'background' in editor_data:
-            image = editor_data['background']
-        elif 'composite' in editor_data:
-            image = editor_data['composite']
-        else:
-            return None
-
+        image = ImageHandler.extract_image_from_editor(editor_data)
         if image is None:
             return None
-
-        if isinstance(image, Image.Image):
-            image = np.array(image)
-
-        if len(image.shape) == 2:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-        elif image.shape[2] == 4:
-            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
 
         h, w = image.shape[:2]
         x1 = max(0, int(coord_x1))
@@ -436,12 +512,18 @@ class EdgeDetectionAppV3:
 
     def get_details(self) -> str:
         """Get detailed classification results."""
+        if self._last_mode == "毛質別のカウント":
+            return self._get_thickness_details()
+        else:
+            return self._get_bw_count_details()
+
+    def _get_thickness_details(self) -> str:
+        """Get details for thickness classification mode."""
         if not self._classified_hairs:
             return "No detections yet"
 
         lines = [f"Total: {len(self._classified_hairs)} hairs\n"]
 
-        # Group by category
         by_category = {"剛毛": [], "硬毛": [], "中間毛": [], "軟毛": []}
         for hair in self._classified_hairs:
             by_category[hair.category].append(hair.width)
@@ -455,25 +537,44 @@ class EdgeDetectionAppV3:
 
         return "\n".join(lines)
 
+    def _get_bw_count_details(self) -> str:
+        """Get details for black/white count mode."""
+        if not self._detections:
+            return "No detections yet"
+
+        lines = [f"Total: {len(self._detections)} hairs\n"]
+
+        sources = {}
+        for d in self._detections:
+            sources[d.source] = sources.get(d.source, 0) + 1
+
+        lines.append("By source:")
+        for source, count in sources.items():
+            lines.append(f"  {source}: {count}")
+
+        areas = [d.area for d in self._detections]
+        if areas:
+            lines.append(f"\nArea statistics:")
+            lines.append(f"  Min: {min(areas)} px")
+            lines.append(f"  Max: {max(areas)} px")
+            lines.append(f"  Avg: {sum(areas)/len(areas):.1f} px")
+
+        return "\n".join(lines)
+
 
 def create_app():
-    """Create Gradio application v3."""
+    """Create Gradio application"""
     app = EdgeDetectionAppV3()
 
     with gr.Blocks(
-        title="Hair Detection v3 - Thickness Classification",
+        title="Hair Detection v3 - Thickness & BW Count",
         theme=gr.themes.Soft()
     ) as demo:
         gr.Markdown("""
-        # Hair Detection v3 - 髭太さ分類
+        # 髭検出・分類
 
-        SAMで検出した髭を太さ（幅）に基づいて4種類に分類:
-        - **剛毛 (Coarse)**: 非常に太い髭 (赤)
-        - **硬毛 (Thick)**: 太い髭 (オレンジ)
-        - **中間毛 (Medium)**: 中程度の髭 (緑)
-        - **軟毛 (Fine)**: 細い髭 (紫)
-
-        各カテゴリの閾値はスライダーで調整可能
+        - **毛質別のカウント**: 太さ（幅）に基づいて4種類に分類
+        - **色別のカウント**: 黒髭・白髭を個別にカウント
         """)
 
         with gr.Row():
@@ -485,15 +586,21 @@ def create_app():
                     height=500,
                 )
 
-                with gr.Accordion("Region Selection (領域選択)", open=True):
-                    selection_mode = gr.Radio(
-                        choices=["freeform", "rectangle", "coordinates"],
-                        value="coordinates",
-                        label="Selection Mode",
-                        info="freeform: 自由線で囲む | rectangle: 矩形描画 | coordinates: 座標入力"
+                with gr.Accordion("検出モード", open=True):
+                    detection_mode = gr.Radio(
+                        choices=["毛質別のカウント", "色別のカウント"],
+                        value="毛質別のカウント",
+                        label="検出モード",
                     )
 
-                with gr.Accordion("Coordinate Input (座標入力)", open=True):
+                with gr.Accordion("領域選択", open=True):
+                    selection_mode = gr.Radio(
+                        choices=["自由な範囲指定", "矩形描画", "座標"],
+                        value="coordinates",
+                        label="Selection Mode",
+                    )
+
+                with gr.Accordion("座標入力", open=True):
                     with gr.Row():
                         coord_x1 = gr.Number(label="X1 (左)", value=400, precision=0)
                         coord_y1 = gr.Number(label="Y1 (上)", value=440, precision=0)
@@ -503,12 +610,11 @@ def create_app():
                     preview_btn = gr.Button("Preview Region", size="sm")
                     coord_preview = gr.Image(label="Coordinate Preview", type="numpy", height=200)
 
-                with gr.Accordion("Hair Color (髭色クラス)", open=True):
+                with gr.Accordion("髭色クラス", open=True):
                     hair_class = gr.Radio(
-                        choices=["black", "white"],
+                        choices=["黒ヒゲ", "白ヒゲ"],
                         value="black",
                         label="Hair Color Class",
-                        info="black: 黒髭（肌より暗い） | white: 白髭（肌より明るい）"
                     )
 
                 with gr.Accordion("SAM Settings (共通)", open=False):
@@ -529,55 +635,121 @@ def create_app():
                         label="Tile Overlap (px)"
                     )
 
-                with gr.Accordion("Filter Parameters (フィルタ)", open=True):
-                    min_area = gr.Slider(
-                        minimum=1, maximum=50, value=5, step=1,
-                        label="Min Area"
-                    )
-                    max_area = gr.Slider(
-                        minimum=50, maximum=5000, value=100, step=10,
-                        label="Max Area"
-                    )
-                    min_aspect = gr.Slider(
-                        minimum=1.0, maximum=5.0, value=1.0, step=0.1,
-                        label="Min Aspect Ratio"
-                    )
-                    brightness_threshold = gr.Slider(
-                        minimum=0.90, maximum=1.20, value=1.00, step=0.01,
-                        label="Brightness Threshold",
-                        info="黒髭: マスク明るさ < 平均×閾値 | 白髭: マスク明るさ > 平均×閾値"
-                    )
-                    gr.Markdown("**Dilation (膨張処理)**")
-                    dilation_kernel = gr.Slider(
-                        minimum=0, maximum=15, value=0, step=1,
-                        label="Dilation Kernel Size",
-                        info="0=OFF, 奇数値推奨 (3, 5, 7...)"
-                    )
-                    dilation_iterations = gr.Slider(
-                        minimum=1, maximum=5, value=1, step=1,
-                        label="Dilation Iterations"
-                    )
+                # ===== Thickness mode parameters =====
+                with gr.Group(visible=True) as thickness_params_group:
+                    with gr.Accordion("Filter Parameters (フィルタ) - 毛質別モード", open=True):
+                        min_area = gr.Slider(
+                            minimum=1, maximum=50, value=5, step=1,
+                            label="最小面積"
+                        )
+                        max_area = gr.Slider(
+                            minimum=50, maximum=5000, value=100, step=10,
+                            label="最大面積"
+                        )
+                        min_aspect = gr.Slider(
+                            minimum=1.0, maximum=5.0, value=1.0, step=0.1,
+                            label="最小アスペクト比"
+                        )
+                        brightness_threshold = gr.Slider(
+                            minimum=0.90, maximum=1.20, value=1.00, step=0.01,
+                            label="明るさの閾値",
+                            info="黒髭: マスク明るさ < 平均×閾値 | 白髭: マスク明るさ > 平均×閾値"
+                        )
+                        gr.Markdown("**膨張処理**")
+                        dilation_kernel = gr.Slider(
+                            minimum=0, maximum=15, value=0, step=1,
+                            label="Dilation Kernel Size",
+                            info="0=OFF, 奇数値推奨 (3, 5, 7...)"
+                        )
+                        dilation_iterations = gr.Slider(
+                            minimum=1, maximum=5, value=1, step=1,
+                            label="Dilation Iterations"
+                        )
 
-                with gr.Accordion("Thickness Thresholds (太さ閾値)", open=True):
-                    gr.Markdown("""
-                    髭の太さ（外接矩形の短辺）で分類する閾値:
-                    - 剛毛 >= Coarse閾値
-                    - 硬毛 >= Thick閾値 (かつ < Coarse閾値)
-                    - 中間毛 >= Medium閾値 (かつ < Thick閾値)
-                    - 軟毛 < Medium閾値
-                    """)
-                    threshold_coarse = gr.Slider(
-                        minimum=1, maximum=20, value=8, step=0.5,
-                        label="剛毛 (Coarse) 閾値 [px]"
-                    )
-                    threshold_thick = gr.Slider(
-                        minimum=1, maximum=15, value=6, step=0.5,
-                        label="硬毛 (Thick) 閾値 [px]"
-                    )
-                    threshold_medium = gr.Slider(
-                        minimum=1, maximum=10, value=4, step=0.5,
-                        label="中間毛 (Medium) 閾値 [px]"
-                    )
+                    with gr.Accordion("太さ閾値", open=True):
+                        gr.Markdown("""
+                        髭の太さ（外接矩形の短辺）で分類する閾値:
+                        - 剛毛 >= Coarse閾値
+                        - 硬毛 >= Thick閾値 (かつ < Coarse閾値)
+                        - 中間毛 >= Medium閾値 (かつ < Thick閾値)
+                        - 軟毛 < Medium閾値
+                        """)
+                        threshold_coarse = gr.Slider(
+                            minimum=1, maximum=20, value=8, step=0.5,
+                            label="剛毛閾値 [px]"
+                        )
+                        threshold_thick = gr.Slider(
+                            minimum=1, maximum=15, value=6, step=0.5,
+                            label="硬毛閾値 [px]"
+                        )
+                        threshold_medium = gr.Slider(
+                            minimum=1, maximum=10, value=4, step=0.5,
+                            label="中間毛閾値 [px]"
+                        )
+
+                # ===== BW Count mode parameters =====
+                with gr.Group(visible=False) as bw_count_params_group:
+                    with gr.Accordion("Black Hair Parameters (黒髭用)", open=True):
+                        gr.Markdown("*肌より暗い髭を検出*")
+                        black_min_area = gr.Slider(
+                            minimum=1, maximum=100, value=5, step=1,
+                            label="Min Area"
+                        )
+                        black_max_area = gr.Slider(
+                            minimum=100, maximum=5000, value=2000, step=100,
+                            label="Max Area"
+                        )
+                        black_min_aspect = gr.Slider(
+                            minimum=1.0, maximum=5.0, value=1.2, step=0.1,
+                            label="Min Aspect Ratio"
+                        )
+                        black_brightness_threshold = gr.Slider(
+                            minimum=0.80, maximum=1.30, value=1.14, step=0.02,
+                            label="Brightness Threshold",
+                            info="マスクの明るさ < 平均×閾値 で検出 (高い=より明るい髭も許容)"
+                        )
+                        gr.Markdown("**Dilation (膨張処理)**")
+                        black_dilation_kernel = gr.Slider(
+                            minimum=0, maximum=15, value=0, step=1,
+                            label="Dilation Kernel Size",
+                            info="0=OFF, 奇数値推奨 (3, 5, 7...) 検出領域を拡大"
+                        )
+                        black_dilation_iterations = gr.Slider(
+                            minimum=1, maximum=5, value=1, step=1,
+                            label="Dilation Iterations",
+                            info="膨張処理の繰り返し回数"
+                        )
+
+                    with gr.Accordion("White Hair Parameters (白髭用)", open=True):
+                        gr.Markdown("*肌より明るい髭を検出*")
+                        white_min_area = gr.Slider(
+                            minimum=1, maximum=100, value=5, step=1,
+                            label="Min Area"
+                        )
+                        white_max_area = gr.Slider(
+                            minimum=100, maximum=5000, value=2000, step=100,
+                            label="Max Area"
+                        )
+                        white_min_aspect = gr.Slider(
+                            minimum=1.0, maximum=5.0, value=1.2, step=0.1,
+                            label="Min Aspect Ratio"
+                        )
+                        white_brightness_threshold = gr.Slider(
+                            minimum=0.70, maximum=1.20, value=0.95, step=0.02,
+                            label="Brightness Threshold",
+                            info="マスクの明るさ > 平均×閾値 で検出 (低い=より暗い髭も許容)"
+                        )
+                        gr.Markdown("**Dilation (膨張処理)**")
+                        white_dilation_kernel = gr.Slider(
+                            minimum=0, maximum=15, value=0, step=1,
+                            label="Dilation Kernel Size",
+                            info="0=OFF, 奇数値推奨 (3, 5, 7...) 検出領域を拡大"
+                        )
+                        white_dilation_iterations = gr.Slider(
+                            minimum=1, maximum=5, value=1, step=1,
+                            label="Dilation Iterations",
+                            info="膨張処理の繰り返し回数"
+                        )
 
                 with gr.Accordion("Duplicate Removal (重複除去)", open=True):
                     overlap_threshold = gr.Slider(
@@ -624,10 +796,27 @@ def create_app():
                 details_btn = gr.Button("Show Details")
                 details_text = gr.Textbox(label="Details", lines=10)
 
+        # Mode visibility toggle
+        def toggle_mode(mode):
+            is_thickness = (mode == "毛質別のカウント")
+            return (
+                gr.update(visible=is_thickness),
+                gr.update(visible=not is_thickness),
+            )
+
+        detection_mode.change(
+            fn=toggle_mode,
+            inputs=[detection_mode],
+            outputs=[thickness_params_group, bw_count_params_group]
+        )
+
         # Legend
         gr.Markdown("""
         ---
         ### 色の凡例
+
+        **毛質別のカウントモード:**
+
         | 色 | カテゴリ | 説明 |
         |----|----------|------|
         | 赤 | 剛毛 (Coarse) | 非常に太い髭 |
@@ -635,20 +824,28 @@ def create_app():
         | 緑 | 中間毛 (Medium) | 中程度の髭 |
         | 紫 | 軟毛 (Fine) | 細い髭 |
 
-        ### 調整のヒント
-        - まず検出を実行し、「幅の統計」のMin/Max/Avgを参考に閾値を調整
-        - 閾値は **剛毛 > 硬毛 > 中間毛** の順に大きくなるよう設定
+        **色別のカウントモード:**
+        - 各髭はレインボーカラーで個別に色分け表示
+
+        ### 黒白分類のパラメータ解説
+
+        **Brightness Threshold の仕組み:**
+        - 各マスクの平均明るさを、ROI（検出領域）全体の平均明るさと比較
+        - **黒髭**: `マスク明るさ < ROI平均 × 閾値` で検出。閾値↑ = 感度上昇
+        - **白髭**: `マスク明るさ > ROI平均 × 閾値` で検出。閾値↓ = 感度上昇
         """)
 
         detect_btn.click(
             fn=app.detect_and_classify,
             inputs=[
                 image_editor,
+                detection_mode,
                 hair_class,
                 sam_points_per_side,
                 use_tiling,
                 tile_size,
                 tile_overlap,
+                # Thickness mode params
                 min_area,
                 max_area,
                 min_aspect,
@@ -658,6 +855,20 @@ def create_app():
                 threshold_coarse,
                 threshold_thick,
                 threshold_medium,
+                # BW Count mode params
+                black_min_area,
+                black_max_area,
+                black_min_aspect,
+                black_brightness_threshold,
+                black_dilation_kernel,
+                black_dilation_iterations,
+                white_min_area,
+                white_max_area,
+                white_min_aspect,
+                white_brightness_threshold,
+                white_dilation_kernel,
+                white_dilation_iterations,
+                # Shared
                 overlap_threshold,
                 selection_mode,
                 coord_x1,
