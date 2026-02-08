@@ -684,7 +684,7 @@ def create_app():
                         )
                         gr.Markdown("**膨張処理**")
                         bw_dilation_kernel = gr.Slider(
-                            minimum=0, maximum=15, value=0, step=1,
+                            minimum=0, maximum=15, value=3, step=1,
                             label="Dilation Kernel Size",
                             info="0=OFF, 奇数値推奨 (3, 5, 7...) 検出領域を拡大"
                         )
@@ -713,50 +713,50 @@ def create_app():
                     **膨張処理**: 検出マスクを膨張させて隣接ピクセルを含める。0=OFF
                     """)
 
-                with gr.Accordion("Duplicate Removal (重複除去)", open=True):
+                with gr.Accordion("検出したマスクの重複除去", open=True):
                     overlap_threshold = gr.Slider(
                         minimum=0.1, maximum=1.0, value=0.5, step=0.05,
                         label="Overlap Threshold",
                         info="重複判定の閾値。高い値=より多くのマスクを保持、低い値=より厳しく重複除去"
                     )
 
-                with gr.Accordion("Visualization", open=False):
+                with gr.Accordion("検出結果の可視化", open=False):
                     overlay_alpha = gr.Slider(
                         minimum=0.1, maximum=0.9, value=0.4, step=0.05,
                         label="Overlay Alpha"
                     )
                     show_markers = gr.Checkbox(value=True, label="Show Center Markers")
 
-                detect_btn = gr.Button("Detect & Classify", variant="primary", size="lg")
+                detect_btn = gr.Button("検出開始", variant="primary", size="lg")
 
             with gr.Column(scale=1):
                 result_image = gr.Image(
-                    label="Detection Result (Color = Category)",
+                    label="検出結果 (色 = 毛質)",
                     type="numpy",
                     height=350
                 )
                 with gr.Row():
                     category_mask_image = gr.Image(
-                        label="Category Mask",
+                        label="毛質別のマスク",
                         type="numpy",
                         height=200
                     )
                     filtered_mask_image = gr.Image(
-                        label="Filtered Mask",
+                        label="フィルター後のマスク",
                         type="numpy",
                         height=200
                     )
                 all_mask_image = gr.Image(
-                    label="All Masks (Unfiltered)",
+                    label="フィルター前の全マスク",
                     type="numpy",
                     height=200
                 )
 
-                count_display = gr.Textbox(label="Category Counts", lines=1)
-                status_text = gr.Textbox(label="Status", lines=14)
+                count_display = gr.Textbox(label="カウント結果", lines=1)
+                status_text = gr.Textbox(label="ステータス", lines=14)
 
-                details_btn = gr.Button("Show Details")
-                details_text = gr.Textbox(label="Details", lines=10)
+                details_btn = gr.Button("詳細を表示")
+                details_text = gr.Textbox(label="詳細", lines=10)
 
         # Mode visibility toggle
         def toggle_mode(mode):
