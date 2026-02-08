@@ -85,20 +85,13 @@ class EdgeDetectionAppV3:
         threshold_coarse: float,
         threshold_thick: float,
         threshold_medium: float,
-        # BW Count mode: black params
-        black_min_area: int,
-        black_max_area: int,
-        black_min_aspect: float,
-        black_brightness_threshold: float,
-        black_dilation_kernel: int,
-        black_dilation_iterations: int,
-        # BW Count mode: white params
-        white_min_area: int,
-        white_max_area: int,
-        white_min_aspect: float,
-        white_brightness_threshold: float,
-        white_dilation_kernel: int,
-        white_dilation_iterations: int,
+        # BW Count mode: params
+        bw_min_area: int,
+        bw_max_area: int,
+        bw_min_aspect: float,
+        bw_brightness_threshold: float,
+        bw_dilation_kernel: int,
+        bw_dilation_iterations: int,
         # Duplicate removal
         overlap_threshold: float,
         # Region selection
@@ -174,28 +167,16 @@ class EdgeDetectionAppV3:
 
         # Build HairClassParams based on detection mode
         if detection_mode == "色別のカウント":
-            if hair_class == "black":
-                params = HairClassParams(
-                    min_area=black_min_area,
-                    max_area=black_max_area,
-                    min_aspect=black_min_aspect,
-                    brightness_threshold=black_brightness_threshold,
-                    brightness_mode='darker',
-                    dilation_kernel_size=black_dilation_kernel,
-                    dilation_iterations=black_dilation_iterations,
-                )
-                current_max_area = black_max_area
-            else:
-                params = HairClassParams(
-                    min_area=white_min_area,
-                    max_area=white_max_area,
-                    min_aspect=white_min_aspect,
-                    brightness_threshold=white_brightness_threshold,
-                    brightness_mode='brighter',
-                    dilation_kernel_size=white_dilation_kernel,
-                    dilation_iterations=white_dilation_iterations,
-                )
-                current_max_area = white_max_area
+            params = HairClassParams(
+                min_area=bw_min_area,
+                max_area=bw_max_area,
+                min_aspect=bw_min_aspect,
+                brightness_threshold=bw_brightness_threshold,
+                brightness_mode='darker' if hair_class == 'black' else 'brighter',
+                dilation_kernel_size=bw_dilation_kernel,
+                dilation_iterations=bw_dilation_iterations,
+            )
+            current_max_area = bw_max_area
         else:  # 毛質別のカウント
             params = HairClassParams(
                 min_area=min_area,
@@ -429,9 +410,6 @@ class EdgeDetectionAppV3:
 
             # Draw region outline
             if selection_mode == "freeform" and freeform_mask is not None:
-                mask_overlay = np.zeros_like(result_image)
-                mask_overlay[freeform_mask > 0] = (0, 255, 255)
-                result_image = cv2.addWeighted(result_image, 1.0, mask_overlay, 0.15, 0)
                 contours, _ = cv2.findContours(
                     freeform_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
                 )
@@ -441,9 +419,6 @@ class EdgeDetectionAppV3:
         else:
             result_image = image.copy()
             if selection_mode == "freeform" and freeform_mask is not None:
-                mask_overlay = np.zeros_like(result_image)
-                mask_overlay[freeform_mask > 0] = (0, 255, 255)
-                result_image = cv2.addWeighted(result_image, 1.0, mask_overlay, 0.15, 0)
                 contours, _ = cv2.findContours(
                     freeform_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
                 )
@@ -464,7 +439,7 @@ class EdgeDetectionAppV3:
 
         if selection_mode == "freeform" and freeform_mask is not None:
             mask_pixels = int(np.sum(freeform_mask > 0))
-            status_lines.append(f"Mask area: {mask_pixels} pixels (黄色で表示)")
+            status_lines.append(f"Mask area: {mask_pixels} pixels")
 
         status_lines.extend([
             f"Region: ({x1},{y1})-({x2},{y2}) = {x2-x1}x{y2-y1}px",
@@ -689,67 +664,54 @@ def create_app():
 
                 # ===== BW Count mode parameters =====
                 with gr.Group(visible=False) as bw_count_params_group:
-                    with gr.Accordion("Black Hair Parameters (黒髭用)", open=True):
-                        gr.Markdown("*肌より暗い髭を検出*")
-                        black_min_area = gr.Slider(
+                    with gr.Accordion("ヒゲの検出用パラメータ", open=True):
+                        bw_min_area = gr.Slider(
                             minimum=1, maximum=100, value=5, step=1,
-                            label="Min Area"
+                            label="最小面積"
                         )
-                        black_max_area = gr.Slider(
+                        bw_max_area = gr.Slider(
                             minimum=100, maximum=5000, value=2000, step=100,
-                            label="Max Area"
+                            label="最大面積"
                         )
-                        black_min_aspect = gr.Slider(
+                        bw_min_aspect = gr.Slider(
                             minimum=1.0, maximum=5.0, value=1.2, step=0.1,
-                            label="Min Aspect Ratio"
+                            label="最小アスペクト比"
                         )
-                        black_brightness_threshold = gr.Slider(
-                            minimum=0.80, maximum=1.30, value=1.14, step=0.02,
-                            label="Brightness Threshold",
-                            info="マスクの明るさ < 平均×閾値 で検出 (高い=より明るい髭も許容)"
+                        bw_brightness_threshold = gr.Slider(
+                            minimum=0.70, maximum=1.30, value=1.14, step=0.02,
+                            label="明るさの閾値",
+                            info="黒髭: マスク明るさ < 平均×閾値 | 白髭: マスク明るさ > 平均×閾値"
                         )
-                        gr.Markdown("**Dilation (膨張処理)**")
-                        black_dilation_kernel = gr.Slider(
+                        gr.Markdown("**膨張処理**")
+                        bw_dilation_kernel = gr.Slider(
                             minimum=0, maximum=15, value=0, step=1,
                             label="Dilation Kernel Size",
                             info="0=OFF, 奇数値推奨 (3, 5, 7...) 検出領域を拡大"
                         )
-                        black_dilation_iterations = gr.Slider(
+                        bw_dilation_iterations = gr.Slider(
                             minimum=1, maximum=5, value=1, step=1,
-                            label="Dilation Iterations",
-                            info="膨張処理の繰り返し回数"
+                            label="膨張処理の繰り返し回数",
                         )
 
-                    with gr.Accordion("White Hair Parameters (白髭用)", open=True):
-                        gr.Markdown("*肌より明るい髭を検出*")
-                        white_min_area = gr.Slider(
-                            minimum=1, maximum=100, value=5, step=1,
-                            label="Min Area"
-                        )
-                        white_max_area = gr.Slider(
-                            minimum=100, maximum=5000, value=2000, step=100,
-                            label="Max Area"
-                        )
-                        white_min_aspect = gr.Slider(
-                            minimum=1.0, maximum=5.0, value=1.2, step=0.1,
-                            label="Min Aspect Ratio"
-                        )
-                        white_brightness_threshold = gr.Slider(
-                            minimum=0.70, maximum=1.20, value=0.95, step=0.02,
-                            label="Brightness Threshold",
-                            info="マスクの明るさ > 平均×閾値 で検出 (低い=より暗い髭も許容)"
-                        )
-                        gr.Markdown("**Dilation (膨張処理)**")
-                        white_dilation_kernel = gr.Slider(
-                            minimum=0, maximum=15, value=0, step=1,
-                            label="Dilation Kernel Size",
-                            info="0=OFF, 奇数値推奨 (3, 5, 7...) 検出領域を拡大"
-                        )
-                        white_dilation_iterations = gr.Slider(
-                            minimum=1, maximum=5, value=1, step=1,
-                            label="Dilation Iterations",
-                            info="膨張処理の繰り返し回数"
-                        )
+                    gr.Markdown("""
+                    ### 黒白分類パラメータの説明
+
+                    **Brightness Threshold (明るさ閾値)** は検出の核となるパラメータです:
+
+                    | クラス | 判定ロジック |
+                    |--------|------------|
+                    | 黒髭 | マスク明るさ < ROI平均×閾値 → 検出 |
+                    | 白髭 | マスク明るさ > ROI平均×閾値 → 検出 |
+
+                    **調整のヒント:**
+                    - 黒髭が検出されない → 閾値を上げる (1.2-1.3)
+                    - 白髭が検出されない → 閾値を下げる (0.85-0.90)
+                    - 誤検出が多い → 最小アスペクト比を上げる (1.5-2.0)
+
+                    **最小/最大面積**: マスクのピクセル面積。小さすぎる/大きすぎる検出を除外
+                    **最小アスペクト比**: 細長さのフィルタ。1.0=すべて許可、2.0=細長いもののみ
+                    **膨張処理**: 検出マスクを膨張させて隣接ピクセルを含める。0=OFF
+                    """)
 
                 with gr.Accordion("Duplicate Removal (重複除去)", open=True):
                     overlap_threshold = gr.Slider(
@@ -856,18 +818,12 @@ def create_app():
                 threshold_thick,
                 threshold_medium,
                 # BW Count mode params
-                black_min_area,
-                black_max_area,
-                black_min_aspect,
-                black_brightness_threshold,
-                black_dilation_kernel,
-                black_dilation_iterations,
-                white_min_area,
-                white_max_area,
-                white_min_aspect,
-                white_brightness_threshold,
-                white_dilation_kernel,
-                white_dilation_iterations,
+                bw_min_area,
+                bw_max_area,
+                bw_min_aspect,
+                bw_brightness_threshold,
+                bw_dilation_kernel,
+                bw_dilation_iterations,
                 # Shared
                 overlap_threshold,
                 selection_mode,
