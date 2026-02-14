@@ -28,6 +28,7 @@ except ImportError:
 
 try:
     from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+    from .timed_sam_mask_generator import TimedSamAutomaticMaskGenerator
     SAM_AVAILABLE = True
 except ImportError:
     pass
@@ -108,21 +109,30 @@ class BlackWhiteHairDetector:
         self.device = get_device()
         print(f"BlackWhiteHairDetector initialized with device: {self.device}")
 
-    def _update_amg_params(self, points_per_side: int = 64):
+    def _update_amg_params(self, points_per_side: int = 64, pred_iou_thresh: float = 0.5, stability_score_thresh: float = 0.6):
         """Update SAM AMG with new parameters."""
         if self._sam_model is None or not self._sam_initialized:
             return
 
-        if points_per_side != self._current_points_per_side:
-            print(f"Updating SAM AMG: points_per_side={points_per_side}")
-            self._sam_amg = SamAutomaticMaskGenerator(
+        # Check if any parameter changed
+        needs_update = (
+            points_per_side != self._current_points_per_side or
+            pred_iou_thresh != getattr(self, '_current_pred_iou_thresh', 0.5) or
+            stability_score_thresh != getattr(self, '_current_stability_score_thresh', 0.6)
+        )
+
+        if needs_update:
+            print(f"Updating SAM AMG: points_per_side={points_per_side}, pred_iou_thresh={pred_iou_thresh}, stability_score_thresh={stability_score_thresh}")
+            self._sam_amg = TimedSamAutomaticMaskGenerator(
                 self._sam_model,
                 points_per_side=points_per_side,
-                pred_iou_thresh=0.5,
-                stability_score_thresh=0.6,
-                min_mask_region_area=3,
+                pred_iou_thresh=pred_iou_thresh,
+                stability_score_thresh=stability_score_thresh,
+                min_mask_region_area=0,
             )
             self._current_points_per_side = points_per_side
+            self._current_pred_iou_thresh = pred_iou_thresh
+            self._current_stability_score_thresh = stability_score_thresh
 
     def _init_sam(self) -> Tuple[bool, str]:
         """Initialize SAM model."""
@@ -152,12 +162,12 @@ class BlackWhiteHairDetector:
             sam = sam_model_registry["vit_h"](checkpoint=sam_path)
             sam.to(device=self.device)
             self._sam_model = sam
-            self._sam_amg = SamAutomaticMaskGenerator(
+            self._sam_amg = TimedSamAutomaticMaskGenerator(
                 sam,
                 points_per_side=64,
                 pred_iou_thresh=0.5,
                 stability_score_thresh=0.6,
-                min_mask_region_area=3,
+                min_mask_region_area=0,
             )
             self._sam_initialized = True
             print(f"SAM initialized on {self.device}")
@@ -175,7 +185,9 @@ class BlackWhiteHairDetector:
         use_tiling: bool = False,
         tile_size: int = 400,
         tile_overlap: int = 50,
-        overlap_threshold: float = 0.5
+        overlap_threshold: float = 0.5,
+        pred_iou_thresh: float = 0.5,
+        stability_score_thresh: float = 0.6
     ) -> Tuple[List[DetectedRegion], List[np.ndarray], Dict]:
         """
         Detect hairs of a specific color class.
@@ -205,7 +217,7 @@ class BlackWhiteHairDetector:
                 print(f"SAM not available: {msg}")
                 return [], [], empty_stats
 
-        self._update_amg_params(points_per_side)
+        self._update_amg_params(points_per_side, pred_iou_thresh, stability_score_thresh)
 
         x1, y1, x2, y2 = region_box
         h, w = image_rgb.shape[:2]
@@ -221,6 +233,15 @@ class BlackWhiteHairDetector:
 
             all_results = []
             all_masks_unfiltered = []
+            total_encode_time = 0.0
+            total_decode_time = 0.0
+            total_quality_filter_time = 0.0
+            total_binarize_time = 0.0
+            total_edge_filter_time = 0.0
+            total_nms_time = 0.0
+            total_rle_time = 0.0
+            total_postprocess_time = 0.0
+            total_generate_time = 0.0
             stats = {
                 'total': 0, 'filtered_area_small': 0, 'filtered_area_large': 0,
                 'filtered_no_contour': 0, 'filtered_zero_dim': 0,
@@ -233,6 +254,21 @@ class BlackWhiteHairDetector:
                 print(f"  Processing tile {idx+1}/{len(tiles)}")
 
                 tile_masks = self._sam_amg.generate(tile_rgb)
+                timings = self._sam_amg.get_timings()
+                total_encode_time += timings['encode_time']
+                total_decode_time += timings['decode_time']
+                total_quality_filter_time += timings['quality_filter_time']
+                total_binarize_time += timings['binarize_time']
+                total_edge_filter_time += timings['edge_filter_time']
+                total_nms_time += timings['nms_time']
+                total_rle_time += timings['rle_time']
+                total_postprocess_time += timings['postprocess_time']
+                total_generate_time += timings['total_time']
+                print(f"    Encode: {timings['encode_time']:.3f}s | Decode: {timings['decode_time']:.3f}s | "
+                      f"QualityFilter: {timings['quality_filter_time']:.3f}s | Binarize: {timings['binarize_time']:.3f}s | "
+                      f"EdgeFilter: {timings['edge_filter_time']:.3f}s | NMS: {timings['nms_time']:.3f}s | "
+                      f"RLE: {timings['rle_time']:.3f}s | PostProcess: {timings['postprocess_time']:.3f}s | "
+                      f"Total: {timings['total_time']:.3f}s")
                 stats['total'] += len(tile_masks)
 
                 # Store all masks
@@ -258,11 +294,22 @@ class BlackWhiteHairDetector:
             # Remove duplicates
             all_results = self._remove_duplicates(all_results, overlap_threshold)
             stats['passed'] = len(all_results)
+            print(f"  Total Encode: {total_encode_time:.3f}s | Decode: {total_decode_time:.3f}s | "
+                  f"QualityFilter: {total_quality_filter_time:.3f}s | Binarize: {total_binarize_time:.3f}s | "
+                  f"EdgeFilter: {total_edge_filter_time:.3f}s | NMS: {total_nms_time:.3f}s | "
+                  f"RLE: {total_rle_time:.3f}s | PostProcess: {total_postprocess_time:.3f}s | "
+                  f"Total: {total_generate_time:.3f}s")
             return all_results, all_masks_unfiltered, stats
 
         # Non-tiled processing
         print("Running SAM Automatic Mask Generation...")
         masks = self._sam_amg.generate(roi)
+        timings = self._sam_amg.get_timings()
+        print(f"  Encode: {timings['encode_time']:.3f}s | Decode: {timings['decode_time']:.3f}s | "
+              f"QualityFilter: {timings['quality_filter_time']:.3f}s | Binarize: {timings['binarize_time']:.3f}s | "
+              f"EdgeFilter: {timings['edge_filter_time']:.3f}s | NMS: {timings['nms_time']:.3f}s | "
+              f"RLE: {timings['rle_time']:.3f}s | PostProcess: {timings['postprocess_time']:.3f}s | "
+              f"Total: {timings['total_time']:.3f}s")
         print(f"SAM AMG generated {len(masks)} masks")
 
         # Store all masks
@@ -586,7 +633,9 @@ class BlackWhiteHairDetector:
         use_tiling: bool = False,
         tile_size: int = 400,
         tile_overlap: int = 50,
-        overlap_threshold: float = 0.5
+        overlap_threshold: float = 0.5,
+        pred_iou_thresh: float = 0.5,
+        stability_score_thresh: float = 0.6
     ) -> Tuple[List[DetectedRegion], List[np.ndarray], Dict]:
         """
         Detect hairs within a freeform mask region.
@@ -641,7 +690,9 @@ class BlackWhiteHairDetector:
             use_tiling=use_tiling,
             tile_size=tile_size,
             tile_overlap=tile_overlap,
-            overlap_threshold=1.0  # Skip duplicate removal here
+            overlap_threshold=1.0,  # Skip duplicate removal here
+            pred_iou_thresh=pred_iou_thresh,
+            stability_score_thresh=stability_score_thresh
         )
 
         # Re-filter using freeform mask for accurate mean_brightness calculation

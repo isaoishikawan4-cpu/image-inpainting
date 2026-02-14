@@ -25,7 +25,7 @@
    膨張処理: 検出マスクを膨張させて隣接ピクセルを含める（0=OFF）。
 
 Usage:
-    python app_single_hair_edge_v3.py
+    python app_sam_edge-detection.py
 
 Requirements:
     pip install gradio numpy opencv-python pillow scipy
@@ -71,6 +71,8 @@ class EdgeDetectionAppV3:
         hair_class: str,
         # SAM params
         sam_points_per_side: int,
+        pred_iou_thresh: float,
+        stability_score_thresh: float,
         use_tiling: bool,
         tile_size: int,
         tile_overlap: int,
@@ -198,6 +200,8 @@ class EdgeDetectionAppV3:
                 tile_size=tile_size,
                 tile_overlap=tile_overlap,
                 overlap_threshold=overlap_threshold,
+                pred_iou_thresh=pred_iou_thresh,
+                stability_score_thresh=stability_score_thresh
             )
         else:
             detections, all_masks, stats = self._detector.detect_with_class(
@@ -207,6 +211,8 @@ class EdgeDetectionAppV3:
                 tile_size=tile_size,
                 tile_overlap=tile_overlap,
                 overlap_threshold=overlap_threshold,
+                pred_iou_thresh=pred_iou_thresh,
+                stability_score_thresh=stability_score_thresh
             )
 
         # Create All Masks visualization (before filtering)
@@ -570,7 +576,7 @@ def create_app():
 
                 with gr.Accordion("領域選択", open=True):
                     selection_mode = gr.Radio(
-                        choices=["自由な範囲指定", "矩形描画", "座標"],
+                        choices=[("自由な範囲指定", "freeform"), ("矩形描画", "rectangle"), ("座標", "coordinates")],
                         value="coordinates",
                         label="Selection Mode",
                     )
@@ -587,7 +593,7 @@ def create_app():
 
                 with gr.Accordion("髭色クラス", open=True):
                     hair_class = gr.Radio(
-                        choices=["黒ヒゲ", "白ヒゲ"],
+                        choices=[("黒ヒゲ", "black"), ("白ヒゲ", "white")],
                         value="black",
                         label="Hair Color Class",
                     )
@@ -597,6 +603,16 @@ def create_app():
                         minimum=32, maximum=128, value=64, step=8,
                         label="SAM Points Per Side",
                         info="Sampling density (64-96 recommended)"
+                    )
+                    pred_iou_thresh = gr.Slider(
+                        minimum=0.0, maximum=1.0, value=0.5, step=0.01,
+                        label="Predicted IoU Threshold",
+                        info="論文デフォルト: 0.88 (高い=厳しい, マスク数減少)"
+                    )
+                    stability_score_thresh = gr.Slider(
+                        minimum=0.0, maximum=1.0, value=0.6, step=0.01,
+                        label="Stability Score Threshold",
+                        info="論文デフォルト: 0.95 (高い=厳しい, QualityFilter処理時間短縮)"
                     )
 
                 with gr.Accordion("Tile Processing", open=False):
@@ -722,10 +738,10 @@ def create_app():
 
                 with gr.Accordion("検出結果の可視化", open=False):
                     overlay_alpha = gr.Slider(
-                        minimum=0.1, maximum=0.9, value=0.4, step=0.05,
+                        minimum=0.1, maximum=0.9, value=0.15, step=0.05,
                         label="Overlay Alpha"
                     )
-                    show_markers = gr.Checkbox(value=True, label="Show Center Markers")
+                    show_markers = gr.Checkbox(value=False, label="Show Center Markers")
 
                 detect_btn = gr.Button("検出開始", variant="primary", size="lg")
 
@@ -804,6 +820,8 @@ def create_app():
                 detection_mode,
                 hair_class,
                 sam_points_per_side,
+                pred_iou_thresh,
+                stability_score_thresh,
                 use_tiling,
                 tile_size,
                 tile_overlap,
